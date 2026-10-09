@@ -13,10 +13,10 @@ import (
 	"github.com/lugvitc/whats4linux/internal/query"
 	mtypes "github.com/lugvitc/whats4linux/internal/types"
 	"github.com/lugvitc/whats4linux/internal/wa"
-	"go.mau.fi/whatsmeow/proto/waE2E"
-	"go.mau.fi/whatsmeow/store"
-	"go.mau.fi/whatsmeow/types"
-	"go.mau.fi/whatsmeow/types/events"
+	"github.com/polymorfa/hypermeow/proto/waE2E"
+	"github.com/polymorfa/hypermeow/store"
+	"github.com/polymorfa/hypermeow/types"
+	"github.com/polymorfa/hypermeow/types/events"
 )
 
 type Reaction struct {
@@ -33,6 +33,8 @@ type ExtendedMessage struct {
 	Media            *wa.Media
 	Edited           bool
 	Forwarded        bool
+	IsDeleted        bool
+	DeliveryStatus   string
 	Reactions        []Reaction
 }
 
@@ -50,6 +52,8 @@ type DecodedMessage struct {
 	ReplyToMessageID string              `json:"reply_to_message_id"`
 	Edited           bool                `json:"edited"`
 	Forwarded        bool                `json:"forwarded"`
+	IsDeleted        bool                `json:"is_deleted"`
+	DeliveryStatus   string              `json:"delivery_status"`
 	Reactions        []Reaction          `json:"reactions"`
 	LinkPreview      *DecodedLinkPreview `json:"link_preview,omitempty"`
 	// Info provides compatibility with frontend that expects types.MessageInfo structure
@@ -132,10 +136,44 @@ type MessageStore struct {
 	stmtUpdateMessage *sql.Stmt
 	stmtUpdateMedia   *sql.Stmt
 
+	selfMu   sync.RWMutex
+	selfUser string
+
 	writeMu    sync.RWMutex
 	writeCh    chan writeRequest
 	writerDone chan struct{}
 	closed     bool
+}
+
+func (ms *MessageStore) SetSelfUser(user string) {
+	ms.selfMu.Lock()
+	defer ms.selfMu.Unlock()
+	ms.selfUser = user
+}
+
+func (ms *MessageStore) GetSelfUser() string {
+	ms.selfMu.RLock()
+	defer ms.selfMu.RUnlock()
+	return ms.selfUser
+}
+
+func (ms *MessageStore) isSelfUser(jidStr string) bool {
+	self := ms.GetSelfUser()
+	if self == "" || jidStr == "" {
+		return false
+	}
+	u := jidStr
+	if idx := strings.Index(u, "@"); idx != -1 {
+		server := u[idx+1:]
+		if strings.Contains(server, "g.us") {
+			return false
+		}
+		u = u[:idx]
+	}
+	if idx := strings.Index(u, ":"); idx != -1 {
+		u = u[:idx]
+	}
+	return u == self
 }
 
 func NewMessageStore() (*MessageStore, error) {
@@ -171,6 +209,12 @@ func NewMessageStore() (*MessageStore, error) {
 		if _, aerr := tx.Exec(query.AddThumbnailColumn); aerr != nil && !strings.Contains(aerr.Error(), "duplicate column") {
 			return aerr
 		}
+		if _, aerr := tx.Exec(query.AddIsDeletedColumn); aerr != nil && !strings.Contains(aerr.Error(), "duplicate column") {
+			return aerr
+		}
+		if _, aerr := tx.Exec(query.AddDeliveryStatusColumn); aerr != nil && !strings.Contains(aerr.Error(), "duplicate column") {
+			return aerr
+		}
 		_, err = tx.Exec(query.CreatePinnedMessagesTable)
 		if err != nil {
 			return err
@@ -198,6 +242,8 @@ func NewMessageStore() (*MessageStore, error) {
 		if _, err = tx.Exec(query.CreateLinkPreviewsTable); err != nil {
 			return err
 		}
+		// Clean up empty protocol noise rows mistakenly saved as normal messages
+		_, _ = tx.Exec(`DELETE FROM messages WHERE (text IS NULL OR text = '') AND has_media = 0 AND is_deleted = 0 AND type = 0`)
 		// Add poster-download key columns to pre-existing link_previews tables.
 		for _, mig := range []string{
 			query.AddLinkPreviewDirectPath, query.AddLinkPreviewMediaKey,
@@ -349,6 +395,14 @@ func UnwrapMessage(m *waE2E.Message) *waE2E.Message {
 			m = m.GetDeviceSentMessage().GetMessage()
 		case m.GetDocumentWithCaptionMessage().GetMessage() != nil:
 			m = m.GetDocumentWithCaptionMessage().GetMessage()
+		case m.GetEditedMessage().GetMessage() != nil:
+			m = m.GetEditedMessage().GetMessage()
+		case m.GetBotInvokeMessage().GetMessage() != nil:
+			m = m.GetBotInvokeMessage().GetMessage()
+		case m.GetGroupMentionedMessage().GetMessage() != nil:
+			m = m.GetGroupMentionedMessage().GetMessage()
+		case m.GetAssociatedChildMessage().GetMessage() != nil:
+			m = m.GetAssociatedChildMessage().GetMessage()
 		default:
 			return m
 		}
@@ -384,7 +438,7 @@ func ExtractMessageText(msg *waE2E.Message) string {
 }
 
 func updateCanonicalJID(ctx context.Context, js store.LIDStore, jid *types.JID) (changed bool) {
-	if jid == nil {
+	if jid == nil || js == nil {
 		return
 	}
 	if jid.ActualAgent() != types.LIDDomain {
@@ -469,8 +523,8 @@ func (ms *MessageStore) MigrateLIDToPN(ctx context.Context, sd store.LIDStore) e
 
 // migrateChatlist migrates chatlist entries from LID to PN when a new PN chat is detected
 func (ms *MessageStore) migrateChatlist(ctx context.Context, sd store.LIDStore, chat types.JID) {
-	if chat.ActualAgent() == types.LIDDomain {
-		// not a jid, skip
+	if sd == nil || chat.ActualAgent() == types.LIDDomain {
+		// not a jid or no lid store, skip
 		return
 	}
 	if _, ok := ms.chatListMap.Get(chat.User); ok {
@@ -513,10 +567,20 @@ func (ms *MessageStore) migrateChatlist(ctx context.Context, sd store.LIDStore, 
 
 // ProcessMessageEvent processes a new message event and stores it in messages.db
 func (ms *MessageStore) ProcessMessageEvent(ctx context.Context, sd store.LIDStore, msg *events.Message, parsedHTML string) string {
+	return ms.ProcessMessageEventWithEdit(ctx, sd, msg, parsedHTML, "", nil)
+}
+
+// ProcessMessageEventWithEdit processes a message event with explicit edit target and content if already decrypted
+func (ms *MessageStore) ProcessMessageEventWithEdit(ctx context.Context, sd store.LIDStore, msg *events.Message, parsedHTML string, explicitEditTargetID string, explicitEditContent *waE2E.Message) string {
 	ms.migrateChatlist(ctx, sd, msg.Info.Chat)
 
 	updateCanonicalJID(ctx, sd, &msg.Info.Chat)
 	updateCanonicalJID(ctx, sd, &msg.Info.Sender)
+
+	msg.Message = UnwrapMessage(msg.Message)
+	if msg.Message == nil {
+		return ""
+	}
 
 	// Handle reactions
 	if msg.Message.GetReactionMessage() != nil {
@@ -533,19 +597,69 @@ func (ms *MessageStore) ProcessMessageEvent(ctx context.Context, sd store.LIDSto
 	}
 
 	// Handle message edits
-	if protoMsg := msg.Message.GetProtocolMessage(); protoMsg != nil && protoMsg.GetType() == waE2E.ProtocolMessage_MESSAGE_EDIT {
-		targetID := protoMsg.GetKey().GetID()
-		newContent := protoMsg.GetEditedMessage()
-		if targetID == "" || newContent == nil {
-			return ""
+	var isEdit bool
+	var editTargetID string
+	var editContent *waE2E.Message
+	var editTimestamp int64
+
+	if explicitEditTargetID != "" && explicitEditContent != nil {
+		isEdit = true
+		editTargetID = explicitEditTargetID
+		editContent = explicitEditContent
+	} else {
+		// First look for ProtocolMessage of type MESSAGE_EDIT (live events or raw messages)
+		var protoMsg *waE2E.ProtocolMessage
+		if unwrapped := UnwrapMessage(msg.Message); unwrapped != nil && unwrapped.GetProtocolMessage() != nil {
+			protoMsg = unwrapped.GetProtocolMessage()
+		} else if msg.RawMessage != nil {
+			if rawUnwrapped := UnwrapMessage(msg.RawMessage); rawUnwrapped != nil && rawUnwrapped.GetProtocolMessage() != nil {
+				protoMsg = rawUnwrapped.GetProtocolMessage()
+			}
 		}
 
-		err := ms.UpdateMessageContent(targetID, newContent, parsedHTML)
-		if err != nil {
-			log.Println("Failed to update edited message:", err)
-			return ""
+		if protoMsg != nil && protoMsg.GetType() == waE2E.ProtocolMessage_MESSAGE_EDIT {
+			isEdit = true
+			if protoMsg.GetKey() != nil {
+				editTargetID = protoMsg.GetKey().GetID()
+			}
+			editContent = UnwrapMessage(protoMsg.GetEditedMessage())
+			if protoMsg.TimestampMS != nil && *protoMsg.TimestampMS > 0 {
+				editTimestamp = *protoMsg.TimestampMS / 1000
+			}
+		} else if msg.IsEdit {
+			isEdit = true
+			editTargetID = msg.Info.ID
+			editContent = UnwrapMessage(msg.Message)
 		}
-		return targetID
+	}
+
+	if editTimestamp == 0 {
+		editTimestamp = msg.Info.Timestamp.Unix()
+	}
+
+	if isEdit {
+		if editTargetID != "" && editContent != nil {
+			err := ms.UpdateMessageContent(&msg.Info, editTargetID, editContent, parsedHTML, editTimestamp)
+			if err != nil {
+				log.Println("Failed to update edited message:", err)
+				return ""
+			}
+			// Also update chatListMap if this chat's latest message was edited
+			chat := msg.Info.Chat.User
+			if chatMsg, ok := ms.chatListMap.Get(chat); ok {
+				var newText string
+				if parsedHTML != "" {
+					newText = parsedHTML
+				} else {
+					newText = ExtractMessageText(editContent)
+				}
+				chatMsg.MessageText = newText
+				ms.chatListMap.Set(chat, chatMsg)
+			}
+			return editTargetID
+		}
+		// If it's an edit but couldn't be resolved, do not insert a blank normal message
+		return ""
 	}
 
 	// Handle revokes: replace the target's content with a deleted marker.
@@ -581,7 +695,8 @@ func (ms *MessageStore) ProcessMessageEvent(ctx context.Context, sd store.LIDSto
 		sender = msg.Info.Sender.User
 	}
 
-	if msg.Info.IsFromMe {
+	if msg.Info.IsFromMe || ms.isSelfUser(msg.Info.Sender.User) || (!strings.Contains(msg.Info.Chat.Server, "g.us") && ms.isSelfUser(msg.Info.Chat.User)) {
+		msg.Info.IsFromMe = true
 		sender = "You"
 	}
 
@@ -689,6 +804,9 @@ func (ms *MessageStore) InsertMessage(info *types.MessageInfo, msg *waE2E.Messag
 	if text == "" && emc == nil {
 		if special, ok := DescribeSpecialMessage(msg); ok {
 			text = special
+		} else {
+			// Do not insert empty protocol noise or unrenderable stubs as normal messages
+			return nil
 		}
 	}
 
@@ -738,7 +856,11 @@ func (ms *MessageStore) InsertMessage(info *types.MessageInfo, msg *waE2E.Messag
 }
 
 // UpdateMessageContent updates an existing message's content
-func (ms *MessageStore) UpdateMessageContent(messageID string, content *waE2E.Message, parsedHTML string) error {
+func (ms *MessageStore) UpdateMessageContent(info *types.MessageInfo, messageID string, content *waE2E.Message, parsedHTML string, editedAt int64) error {
+	content = UnwrapMessage(content)
+	if content == nil {
+		return nil
+	}
 
 	var (
 		text, fileName string
@@ -749,21 +871,45 @@ func (ms *MessageStore) UpdateMessageContent(messageID string, content *waE2E.Me
 
 	text, fileName, _, _, emc, mediaType, width, height = extractMessageContent(content)
 
-	if text == "" {
-		return nil
-	}
-
 	if parsedHTML != "" {
 		text = parsedHTML
 	}
 
+	if text == "" && emc == nil {
+		if special, ok := DescribeSpecialMessage(content); ok {
+			text = special
+		} else {
+			return nil
+		}
+	}
+
 	return ms.runSync(func(tx *sql.Tx) error {
-		_, err := tx.Stmt(ms.stmtUpdateMessage).Exec(
+		res, err := tx.Stmt(ms.stmtUpdateMessage).Exec(
 			text,
 			messageID,
 		)
 		if err != nil {
 			return err
+		}
+
+		// If the target message did not exist in DB yet, insert it with edited=true
+		if ra, _ := res.RowsAffected(); ra == 0 && info != nil {
+			_, err = tx.Stmt(ms.stmtInsertMessage).Exec(
+				messageID,
+				info.Chat.String(),
+				info.Sender.String(),
+				info.Timestamp.Unix(),
+				info.IsFromMe,
+				text,
+				emc != nil,
+				"",   // replyToMessageID
+				true, // edited = true
+				false,
+				mtypes.MessageTypeNormal,
+			)
+			if err != nil {
+				return err
+			}
 		}
 		// no media to process
 		if emc == nil {
@@ -789,14 +935,16 @@ func (ms *MessageStore) UpdateMessageContent(messageID string, content *waE2E.Me
 // GetMessageWithRaw returns a message with its raw protobuf content for media download
 func (ms *MessageStore) GetMessageWithMedia(chatJID string, messageID string) (*ExtendedMessage, error) {
 	var (
-		sender    string
-		timestamp int64
-		isFromMe  bool
-		text      sql.NullString
-		hasMedia  bool
-		replyTo   sql.NullString
-		edited    bool
-		forwarded bool
+		sender         string
+		timestamp      int64
+		isFromMe       bool
+		text           sql.NullString
+		hasMedia       bool
+		replyTo        sql.NullString
+		edited         bool
+		forwarded      bool
+		isDeleted      bool
+		deliveryStatus string
 	)
 
 	err := ms.db.QueryRow(query.SelectMessageByChatAndID, chatJID, messageID).Scan(
@@ -808,6 +956,8 @@ func (ms *MessageStore) GetMessageWithMedia(chatJID string, messageID string) (*
 		&replyTo,
 		&edited,
 		&forwarded,
+		&isDeleted,
+		&deliveryStatus,
 	)
 
 	if err != nil {
@@ -855,6 +1005,7 @@ func (ms *MessageStore) GetMessageWithMedia(chatJID string, messageID string) (*
 			mimetype.String,
 			width, height,
 			mtypes.MediaType(mediaType),
+			fileName.String,
 		)
 	}
 
@@ -873,21 +1024,25 @@ func (ms *MessageStore) GetMessageWithMedia(chatJID string, messageID string) (*
 		Media:            media,
 		Edited:           edited,
 		Forwarded:        forwarded,
+		IsDeleted:        isDeleted,
+		DeliveryStatus:   deliveryStatus,
 	}, nil
 }
 
 // GetMessageWithRaw returns a message with its raw protobuf content for media download
 func (ms *MessageStore) GetMessageWithMediaByID(messageID string) (*ExtendedMessage, error) {
 	var (
-		chat      string
-		sender    string
-		timestamp int64
-		isFromMe  bool
-		text      sql.NullString
-		hasMedia  bool
-		replyTo   sql.NullString
-		edited    bool
-		forwarded bool
+		chat           string
+		sender         string
+		timestamp      int64
+		isFromMe       bool
+		text           sql.NullString
+		hasMedia       bool
+		replyTo        sql.NullString
+		edited         bool
+		forwarded      bool
+		isDeleted      bool
+		deliveryStatus string
 	)
 
 	err := ms.db.QueryRow(query.SelectMessageByID, messageID).Scan(
@@ -900,6 +1055,8 @@ func (ms *MessageStore) GetMessageWithMediaByID(messageID string) (*ExtendedMess
 		&replyTo,
 		&edited,
 		&forwarded,
+		&isDeleted,
+		&deliveryStatus,
 	)
 
 	if err != nil {
@@ -917,6 +1074,7 @@ func (ms *MessageStore) GetMessageWithMediaByID(messageID string) (*ExtendedMess
 			url           sql.NullString
 			mimetype      sql.NullString
 			directPath    sql.NullString
+			fileName      sql.NullString
 			mediaKey      []byte
 			fileSHA256    []byte
 			fileEncSHA256 []byte
@@ -932,6 +1090,7 @@ func (ms *MessageStore) GetMessageWithMediaByID(messageID string) (*ExtendedMess
 			&fileEncSHA256,
 			&width,
 			&height,
+			&fileName,
 		)
 		if err != nil {
 			return nil, err
@@ -943,6 +1102,7 @@ func (ms *MessageStore) GetMessageWithMediaByID(messageID string) (*ExtendedMess
 			mimetype.String,
 			width, height,
 			mtypes.MediaType(mediaType),
+			fileName.String,
 		)
 	}
 
@@ -961,6 +1121,8 @@ func (ms *MessageStore) GetMessageWithMediaByID(messageID string) (*ExtendedMess
 		Media:            media,
 		Edited:           edited,
 		Forwarded:        forwarded,
+		IsDeleted:        isDeleted,
+		DeliveryStatus:   deliveryStatus,
 	}, nil
 }
 
@@ -1033,11 +1195,16 @@ func (ms *MessageStore) chatListFromQuery(q string) []ChatMessage {
 			messageText = text.String
 		}
 
+		sender := senderJID
+		if isFromMe || ms.isSelfUser(senderJID) || (!strings.Contains(jid.Server, "g.us") && ms.isSelfUser(jid.User)) {
+			sender = "You"
+		}
+
 		chatMsg := ChatMessage{
 			JID:         jid,
 			MessageText: messageText,
 			MessageTime: timestamp,
-			Sender:      senderJID,
+			Sender:      sender,
 		}
 
 		// Cache per-chat entry
@@ -1299,6 +1466,8 @@ func (ms *MessageStore) GetDecodedMessagesPaged(chatJID string, beforeTimestamp 
 			text               sql.NullString
 			replyTo            sql.NullString
 			edited, forwarded  bool
+			isDeleted          bool
+			deliveryStatus     string
 			msgType            sql.NullInt32
 			fileName           sql.NullString
 			width, height      sql.NullInt64
@@ -1319,6 +1488,8 @@ func (ms *MessageStore) GetDecodedMessagesPaged(chatJID string, beforeTimestamp 
 			&replyTo,
 			&edited,
 			&forwarded,
+			&isDeleted,
+			&deliveryStatus,
 			&msgType,
 			&fileName,
 			&width,
@@ -1340,16 +1511,19 @@ func (ms *MessageStore) GetDecodedMessagesPaged(chatJID string, beforeTimestamp 
 				Description: previewDescription.String, HasPoster: previewHasPoster.Bool,
 			}
 		}
+		isMsgFromMe := isFromMe || ms.isSelfUser(senderJID) || (!strings.Contains(chatJIDRow, "g.us") && ms.isSelfUser(chatJIDRow))
 		page = append(page, decodedPageRow{
 			message: DecodedMessage{
 				Type:             mtypes.MediaType(msgType.Int32),
 				ReplyToMessageID: replyTo.String,
 				Edited:           edited,
 				Forwarded:        forwarded,
+				IsDeleted:        isDeleted,
+				DeliveryStatus:   deliveryStatus,
 				Info: DecodedMessageInfo{
 					ID:        msgID,
 					Timestamp: time.Unix(timestamp, 0).Format(time.RFC3339),
-					IsFromMe:  isFromMe,
+					IsFromMe:  isMsgFromMe,
 					PushName:  "",
 					Sender:    senderJID,
 					Chat:      chatJIDRow,
@@ -1444,6 +1618,7 @@ func (ms *MessageStore) loadReactionsByMessageIDs(messageIDs []string) (map[stri
 	}
 	return result, rows.Err()
 }
+
 
 func (ms *MessageStore) loadQuotedContents(messageIDs []string) (map[string]quotedContent, error) {
 	result := make(map[string]quotedContent, len(messageIDs))
@@ -1654,6 +1829,8 @@ func (ms *MessageStore) GetDecodedMessage(chatJID string, messageID string) (*De
 		isFromMe           bool
 		replyTo            sql.NullString
 		edited, forwarded  bool
+		isDeleted          bool
+		deliveryStatus     string
 		text               sql.NullString
 		msgType            sql.NullInt32
 		fileName           sql.NullString
@@ -1667,27 +1844,54 @@ func (ms *MessageStore) GetDecodedMessage(chatJID string, messageID string) (*De
 
 	// Use runSync to ensure read consistency with pending writes
 	err := ms.runSync(func(tx *sql.Tx) error {
-		err := tx.QueryRow(query.SelectDecodedMessageByChatAndID, chatJID, messageID).Scan(
-			&sender,
-			&timestamp,
-			&isFromMe,
-			&text,
-			&replyTo,
-			&edited,
-			&forwarded,
-			&msgType,
-			&fileName,
-			&width,
-			&height,
-			&gif,
-			&previewURL,
-			&previewTitle,
-			&previewDescription,
-			&previewHasPoster,
-		)
+		var qErr error
+		if chatJID != "" {
+			qErr = tx.QueryRow(query.SelectDecodedMessageByChatAndID, chatJID, messageID).Scan(
+				&sender,
+				&timestamp,
+				&isFromMe,
+				&text,
+				&replyTo,
+				&edited,
+				&forwarded,
+				&isDeleted,
+				&deliveryStatus,
+				&msgType,
+				&fileName,
+				&width,
+				&height,
+				&gif,
+				&previewURL,
+				&previewTitle,
+				&previewDescription,
+				&previewHasPoster,
+			)
+		}
+		if chatJID == "" || errors.Is(qErr, sql.ErrNoRows) {
+			qErr = tx.QueryRow(query.SelectDecodedMessageByID, messageID).Scan(
+				&sender,
+				&timestamp,
+				&isFromMe,
+				&text,
+				&replyTo,
+				&edited,
+				&forwarded,
+				&isDeleted,
+				&deliveryStatus,
+				&msgType,
+				&fileName,
+				&width,
+				&height,
+				&gif,
+				&previewURL,
+				&previewTitle,
+				&previewDescription,
+				&previewHasPoster,
+			)
+		}
 
-		if err != nil {
-			return err
+		if qErr != nil {
+			return qErr
 		}
 
 		return nil
@@ -1697,15 +1901,18 @@ func (ms *MessageStore) GetDecodedMessage(chatJID string, messageID string) (*De
 		return nil, err
 	}
 
+	isMsgFromMe := isFromMe || ms.isSelfUser(sender) || (!strings.Contains(chatJID, "g.us") && ms.isSelfUser(chatJID))
 	msg := DecodedMessage{
 		Type:             mtypes.MediaType(msgType.Int32),
 		Edited:           edited,
 		Forwarded:        forwarded,
+		IsDeleted:        isDeleted,
+		DeliveryStatus:   deliveryStatus,
 		ReplyToMessageID: replyTo.String,
 		Info: DecodedMessageInfo{
 			ID:        messageID,
 			Timestamp: time.Unix(timestamp, 0).Format(time.RFC3339),
-			IsFromMe:  isFromMe,
+			IsFromMe:  isMsgFromMe,
 			PushName:  "",
 			Sender:    sender,
 			Chat:      chatJID,
@@ -1913,11 +2120,76 @@ func (ms *MessageStore) GetArchivedChats() map[string]int64 {
 	return archived
 }
 
+// IsChatArchived returns whether the specified chat is archived.
+func (ms *MessageStore) IsChatArchived(chatJID string) bool {
+	var count int
+	err := ms.db.QueryRow(`SELECT COUNT(1) FROM archived_chats WHERE chat_jid = ?`, chatJID).Scan(&count)
+	return err == nil && count > 0
+}
+
+// GetLatestMessageForChat retrieves the latest message details for a chat, used to construct
+// accurate sync ranges when archiving or syncing state with WhatsApp.
+func (ms *MessageStore) GetLatestMessageForChat(chatJID string) (messageID string, timestamp int64, isFromMe bool, senderJID string, found bool) {
+	row := ms.db.QueryRow(`
+		SELECT message_id, timestamp, is_from_me, sender_jid
+		FROM messages
+		WHERE chat_jid = ?
+		ORDER BY timestamp DESC
+		LIMIT 1`, chatJID)
+	var id, sender string
+	var ts int64
+	var fromMe bool
+	if err := row.Scan(&id, &ts, &fromMe, &sender); err != nil {
+		return "", 0, false, "", false
+	}
+	return id, ts, fromMe, sender, true
+}
+
 // MarkMessageDeleted replaces a revoked message's content with a deleted
 // marker, mirroring WhatsApp's "This message was deleted".
 func (ms *MessageStore) MarkMessageDeleted(messageID string) error {
-	_, err := ms.db.Exec(
-		`UPDATE messages SET text = ?, has_media = 0 WHERE message_id = ?`,
-		`<i>🚫 This message was deleted</i>`, messageID)
+	return ms.runSync(func(tx *sql.Tx) error {
+		_, _ = tx.Exec(`DELETE FROM message_media WHERE message_id = ?`, messageID)
+		_, _ = tx.Exec(`DELETE FROM link_previews WHERE message_id = ?`, messageID)
+		_, err := tx.Exec(
+			`UPDATE messages SET text = ?, has_media = 0, is_deleted = 1 WHERE message_id = ?`,
+			`<i>🚫 This message was deleted</i>`, messageID)
+		return err
+	})
+}
+
+// UpdateDeliveryStatus updates the delivery status of messages in SQLite.
+// Status progression: pending -> sent -> delivered -> read.
+func (ms *MessageStore) UpdateDeliveryStatus(messageIDs []string, status string) error {
+	if len(messageIDs) == 0 {
+		return nil
+	}
+	marks, args := placeholders(messageIDs)
+	var q string
+	switch status {
+	case "read":
+		q = "UPDATE messages SET delivery_status = 'read' WHERE message_id IN (" + marks + ")"
+	case "delivered":
+		q = "UPDATE messages SET delivery_status = 'delivered' WHERE message_id IN (" + marks + ") AND delivery_status != 'read'"
+	case "sent":
+		q = "UPDATE messages SET delivery_status = 'sent' WHERE message_id IN (" + marks + ") AND delivery_status NOT IN ('delivered', 'read')"
+	default:
+		return nil
+	}
+	_, err := ms.db.Exec(q, args...)
 	return err
 }
+
+// DeleteMessageLocally completely removes a message and its associated records from local storage.
+func (ms *MessageStore) DeleteMessageLocally(messageID string) error {
+	return ms.runSync(func(tx *sql.Tx) error {
+		_, _ = tx.Exec(`DELETE FROM message_media WHERE message_id = ?`, messageID)
+		_, _ = tx.Exec(`DELETE FROM link_previews WHERE message_id = ?`, messageID)
+		_, _ = tx.Exec(`DELETE FROM reactions WHERE message_id = ?`, messageID)
+		_, _ = tx.Exec(`DELETE FROM pinned_messages WHERE message_id = ?`, messageID)
+		_, err := tx.Exec(`DELETE FROM messages WHERE message_id = ?`, messageID)
+		return err
+	})
+}
+
+

@@ -2,11 +2,14 @@ package api
 
 import (
 	"log"
+	"strings"
 	"time"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
-	"go.mau.fi/whatsmeow/appstate"
-	"go.mau.fi/whatsmeow/types"
+	"github.com/polymorfa/hypermeow/appstate"
+	"github.com/polymorfa/hypermeow/proto/waCommon"
+	"github.com/polymorfa/hypermeow/types"
+	"google.golang.org/protobuf/proto"
 )
 
 type ChatElement struct {
@@ -59,9 +62,28 @@ func (a *Api) ToggleChatArchive(jidStr string, archived bool) error {
 		return err
 	}
 	runtime.EventsEmit(a.ctx, "wa:chat_list_refresh")
-	if err := a.waClient.SendAppState(a.ctx, appstate.BuildArchive(jid, archived, time.Time{}, nil)); err != nil {
-		log.Println("ToggleChatArchive: app state sync failed (kept local):", err)
-		a.startBackground(a.resyncAppState)
+
+	var lastMsgTS time.Time
+	var lastMsgKey *waCommon.MessageKey
+	if a.messageStore != nil {
+		if msgID, ts, fromMe, sender, ok := a.messageStore.GetLatestMessageForChat(jidStr); ok {
+			lastMsgTS = time.Unix(ts, 0)
+			lastMsgKey = &waCommon.MessageKey{
+				RemoteJID: proto.String(jidStr),
+				FromMe:    proto.Bool(fromMe),
+				ID:        proto.String(msgID),
+			}
+			if jid.Server == types.GroupServer && !fromMe && sender != "" {
+				lastMsgKey.Participant = proto.String(sender)
+			}
+		}
+	}
+
+	if a.waClient != nil && a.waClient.IsConnected() {
+		if err := a.waClient.SendAppState(a.ctx, appstate.BuildArchive(jid, archived, lastMsgTS, lastMsgKey)); err != nil {
+			log.Println("ToggleChatArchive: app state sync failed (kept local):", err)
+			a.startBackground(a.resyncAppState)
+		}
 	}
 	return nil
 }
@@ -103,6 +125,13 @@ func (a *Api) GetChatList() ([]ChatElement, error) {
 				JID:      cm.JID.String(),
 				FullName: name,
 			}
+		} else if a.waClient != nil && a.waClient.Store != nil && a.waClient.Store.ID != nil && cm.JID.User == a.waClient.Store.ID.User && !strings.Contains(cm.JID.Server, "g.us") {
+			fc = Contact{
+				JID:      cm.JID.String(),
+				FullName: "You",
+				PushName: "Message yourself",
+			}
+			cm.Sender = "You"
 		} else {
 			contact, err := a.waClient.Store.Contacts.GetContact(a.ctx, cm.JID)
 			if err != nil {

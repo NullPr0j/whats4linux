@@ -15,7 +15,9 @@ const (
 		reply_to_message_id TEXT,
 		edited BOOLEAN DEFAULT FALSE,
 		forwarded BOOLEAN DEFAULT FALSE,
-		type INTEGER DEFAULT 0
+		type INTEGER DEFAULT 0,
+		is_deleted BOOLEAN DEFAULT FALSE,
+		delivery_status TEXT DEFAULT 'sent'
 	);
 		CREATE INDEX IF NOT EXISTS idx_messages_chat_jid ON messages(chat_jid);
 		CREATE INDEX IF NOT EXISTS idx_messages_sender_jid ON messages(sender_jid);
@@ -23,10 +25,29 @@ const (
 		CREATE INDEX IF NOT EXISTS idx_messages_chat_cursor ON messages(chat_jid, timestamp DESC, message_id DESC);
 	`
 
+	AddIsDeletedColumn = `
+	ALTER TABLE messages ADD COLUMN is_deleted BOOLEAN DEFAULT 0;
+	`
+
+	AddDeliveryStatusColumn = `
+	ALTER TABLE messages ADD COLUMN delivery_status TEXT DEFAULT 'sent';
+	`
+
 	InsertMessage = `
-	INSERT OR REPLACE INTO messages 
+	INSERT INTO messages 
 	(message_id, chat_jid, sender_jid, timestamp, is_from_me, text, has_media, reply_to_message_id, edited, forwarded, type)
 	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	ON CONFLICT(message_id) DO UPDATE SET
+		chat_jid = excluded.chat_jid,
+		sender_jid = excluded.sender_jid,
+		timestamp = excluded.timestamp,
+		is_from_me = excluded.is_from_me,
+		text = excluded.text,
+		has_media = excluded.has_media,
+		reply_to_message_id = excluded.reply_to_message_id,
+		edited = CASE WHEN messages.edited = 1 OR excluded.edited = 1 THEN 1 ELSE 0 END,
+		forwarded = excluded.forwarded,
+		type = excluded.type
 	`
 
 	UpdateMessage = `
@@ -36,13 +57,15 @@ const (
 	`
 
 	SelectMessageByID = `
-	SELECT chat_jid, sender_jid, timestamp, is_from_me, text, has_media, reply_to_message_id, edited, forwarded
+	SELECT chat_jid, sender_jid, timestamp, is_from_me, text, has_media, reply_to_message_id, edited, forwarded,
+	       COALESCE(is_deleted, 0), COALESCE(delivery_status, 'sent')
 	FROM messages
 	WHERE message_id = ?
 	`
 
 	SelectDecodedMessageByChatAndID = `
 	SELECT m.sender_jid, m.timestamp, m.is_from_me, m.text, m.reply_to_message_id, m.edited, m.forwarded,
+	       COALESCE(m.is_deleted, 0), COALESCE(m.delivery_status, 'sent'),
 	       mm.type, mm.file_name, mm.width, mm.height, mm.gif_playback,
 	       lp.url, lp.title, lp.description,
 	       CASE WHEN length(COALESCE(lp.thumbnail, x'')) > 0 OR
@@ -52,6 +75,21 @@ const (
 	LEFT JOIN message_media AS mm ON mm.message_id = m.message_id
 	LEFT JOIN link_previews AS lp ON lp.message_id = m.message_id
 	WHERE m.chat_jid = ? AND m.message_id = ?
+	LIMIT 1
+	`
+
+	SelectDecodedMessageByID = `
+	SELECT m.sender_jid, m.timestamp, m.is_from_me, m.text, m.reply_to_message_id, m.edited, m.forwarded,
+	       COALESCE(m.is_deleted, 0), COALESCE(m.delivery_status, 'sent'),
+	       mm.type, mm.file_name, mm.width, mm.height, mm.gif_playback,
+	       lp.url, lp.title, lp.description,
+	       CASE WHEN length(COALESCE(lp.thumbnail, x'')) > 0 OR
+	                      (COALESCE(lp.direct_path, '') <> '' AND length(COALESCE(lp.media_key, x'')) > 0)
+	            THEN 1 ELSE 0 END
+	FROM messages AS m
+	LEFT JOIN message_media AS mm ON mm.message_id = m.message_id
+	LEFT JOIN link_previews AS lp ON lp.message_id = m.message_id
+	WHERE m.message_id = ?
 	LIMIT 1
 	`
 
@@ -70,13 +108,14 @@ const (
 	// Messages.db paged queries (for frontend)
 	SelectMessagesByChatBeforeCursor = `
 	SELECT m.message_id, m.chat_jid, m.sender_jid, m.timestamp, m.is_from_me, m.text, m.reply_to_message_id, m.edited, m.forwarded,
+	       COALESCE(m.is_deleted, 0), COALESCE(m.delivery_status, 'sent'),
 	       mm.type, mm.file_name, mm.width, mm.height, mm.gif_playback,
 	       lp.url, lp.title, lp.description,
 	       CASE WHEN length(COALESCE(lp.thumbnail, x'')) > 0 OR
 	                      (COALESCE(lp.direct_path, '') <> '' AND length(COALESCE(lp.media_key, x'')) > 0)
 	            THEN 1 ELSE 0 END
 	FROM (
-		SELECT message_id, chat_jid, sender_jid, timestamp, is_from_me, text, reply_to_message_id, edited, forwarded
+		SELECT message_id, chat_jid, sender_jid, timestamp, is_from_me, text, reply_to_message_id, edited, forwarded, is_deleted, delivery_status
 		FROM messages
 		WHERE chat_jid = ?
 		  AND (timestamp < ? OR (timestamp = ? AND message_id < ?))
@@ -90,13 +129,14 @@ const (
 
 	SelectLatestMessagesByChat = `
 	SELECT m.message_id, m.chat_jid, m.sender_jid, m.timestamp, m.is_from_me, m.text, m.reply_to_message_id, m.edited, m.forwarded,
+	       COALESCE(m.is_deleted, 0), COALESCE(m.delivery_status, 'sent'),
 	       mm.type, mm.file_name, mm.width, mm.height, mm.gif_playback,
 	       lp.url, lp.title, lp.description,
 	       CASE WHEN length(COALESCE(lp.thumbnail, x'')) > 0 OR
 	                      (COALESCE(lp.direct_path, '') <> '' AND length(COALESCE(lp.media_key, x'')) > 0)
 	            THEN 1 ELSE 0 END
 	FROM (
-		SELECT message_id, chat_jid, sender_jid, timestamp, is_from_me, text, reply_to_message_id, edited, forwarded
+		SELECT message_id, chat_jid, sender_jid, timestamp, is_from_me, text, reply_to_message_id, edited, forwarded, is_deleted, delivery_status
 		FROM messages
 		WHERE chat_jid = ?
 		ORDER BY timestamp DESC, message_id DESC
@@ -118,7 +158,8 @@ const (
 	`
 
 	SelectMessageByChatAndID = `
-	SELECT sender_jid, timestamp, is_from_me, text, has_media, reply_to_message_id, edited, forwarded
+	SELECT sender_jid, timestamp, is_from_me, text, has_media, reply_to_message_id, edited, forwarded,
+	       COALESCE(is_deleted, 0), COALESCE(delivery_status, 'sent')
 	FROM messages
 	WHERE chat_jid = ? AND message_id = ?
 	LIMIT 1
