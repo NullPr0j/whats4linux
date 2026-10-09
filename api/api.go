@@ -21,13 +21,13 @@ import (
 	"github.com/lugvitc/whats4linux/shared/socket"
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
-	"go.mau.fi/whatsmeow"
-	"go.mau.fi/whatsmeow/appstate"
-	"go.mau.fi/whatsmeow/proto/waE2E"
-	"go.mau.fi/whatsmeow/store/sqlstore"
-	"go.mau.fi/whatsmeow/types"
-	"go.mau.fi/whatsmeow/types/events"
-	waLog "go.mau.fi/whatsmeow/util/log"
+	"github.com/polymorfa/hypermeow"
+	"github.com/polymorfa/hypermeow/appstate"
+	"github.com/polymorfa/hypermeow/proto/waE2E"
+	"github.com/polymorfa/hypermeow/store/sqlstore"
+	"github.com/polymorfa/hypermeow/types"
+	"github.com/polymorfa/hypermeow/types/events"
+	waLog "github.com/polymorfa/hypermeow/util/log"
 )
 
 // Api struct
@@ -52,6 +52,9 @@ type Api struct {
 	windowFocused       atomic.Bool
 	groupRepairInFlight atomic.Bool
 	appStateResync      atomic.Bool
+	callManager         *wa.CallManager
+	activeChatMu        sync.RWMutex
+	activeChatId        string
 }
 
 // repairGroupNames heals whats4linux_groups rows that are missing or were
@@ -140,20 +143,187 @@ func (a *Api) SetWindowFocused(focused bool) {
 	a.windowFocused.Store(focused)
 }
 
+// SetActiveChat records which chat is currently open in the UI so incoming
+// messages for that chat are suppressed while the user is actively viewing it.
+func (a *Api) SetActiveChat(chatId string) {
+	a.activeChatMu.Lock()
+	a.activeChatId = chatId
+	a.activeChatMu.Unlock()
+}
+
+func (a *Api) isSameChat(activeChat string, incomingChat types.JID) bool {
+	if activeChat == "" {
+		return false
+	}
+	if activeChat == incomingChat.String() {
+		return true
+	}
+	activeJID, err := types.ParseJID(activeChat)
+	if err == nil && a.waClient != nil {
+		activeCanon := canonicalUserJID(a.ctx, a.waClient, activeJID)
+		incomingCanon := canonicalUserJID(a.ctx, a.waClient, incomingChat)
+		if activeCanon.String() == incomingCanon.String() {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveGroupName returns the display name of a group chat, querying local cache,
+// contacts store, or fetching from WhatsApp server as needed.
+func (a *Api) resolveGroupName(chat types.JID) string {
+	if a.cw != nil {
+		if groupInfo, err := a.cw.FetchGroup(chat.String()); err == nil && groupInfo.Name != "" {
+			return groupInfo.Name
+		}
+	}
+	if a.waClient != nil {
+		if a.waClient.Store != nil && a.waClient.Store.Contacts != nil {
+			if contact, err := a.waClient.Store.Contacts.GetContact(a.ctx, chat); err == nil && contact.FullName != "" {
+				return contact.FullName
+			}
+		}
+		if a.waClient.IsConnected() {
+			if gi, err := a.waClient.GetGroupInfo(a.ctx, chat); err == nil && gi != nil && gi.GroupName.Name != "" {
+				if a.cw != nil {
+					_ = a.cw.StoreGroup(wa.Group{
+						JID:              chat.String(),
+						Name:             gi.GroupName.Name,
+						Topic:            gi.GroupTopic.Topic,
+						OwnerJID:         gi.OwnerJID.String(),
+						ParticipantCount: len(gi.Participants),
+						IsParent:         gi.IsParent,
+						IsDefaultSub:     gi.IsDefaultSubGroup,
+					})
+				}
+				return gi.GroupName.Name
+			}
+		}
+	}
+	return ""
+}
+
+// resolveSenderName returns the contact name, push name, or formatted user ID for a sender.
+func (a *Api) resolveSenderName(sender types.JID, pushName string) string {
+	if pushName != "" {
+		return pushName
+	}
+	if a.waClient != nil && a.waClient.Store != nil && a.waClient.Store.Contacts != nil {
+		if contact, err := a.waClient.Store.Contacts.GetContact(a.ctx, sender); err == nil && contact.FullName != "" {
+			return contact.FullName
+		}
+	}
+	if sender.User != "" {
+		return "+" + sender.User
+	}
+	return "Someone"
+}
+
 // notifyIncoming raises a desktop notification for an incoming message when the
 // window isn't focused.
-func (a *Api) notifyIncoming(v *events.Message, parsedHTML string) {
-	title := v.Info.PushName
-	if title == "" {
-		title = "New message"
+func (a *Api) notifyIncoming(v *events.Message, parsedHTML string, isEdit bool) {
+	if a.messageStore != nil && (a.messageStore.IsChatArchived(v.Info.Chat.String()) || a.messageStore.IsChatMuted(v.Info.Chat.String())) {
+		return
 	}
-	body := strings.TrimSpace(htmlTagRE.ReplaceAllString(parsedHTML, ""))
-	if body == "" {
-		body = "Sent you a message"
+
+	bodyText := strings.TrimSpace(htmlTagRE.ReplaceAllString(parsedHTML, ""))
+	if bodyText == "" {
+		if isEdit {
+			bodyText = "Edited a message"
+		} else {
+			bodyText = "Sent you a message"
+		}
+	} else if isEdit {
+		bodyText = "(Edited) " + bodyText
 	}
-	if err := beeep.Notify(title, body, ""); err != nil {
+
+	isGroup := v.Info.IsGroup || v.Info.Chat.Server == types.GroupServer
+	var title, body string
+
+	if isGroup {
+		groupName := a.resolveGroupName(v.Info.Chat)
+		senderName := a.resolveSenderName(v.Info.Sender, v.Info.PushName)
+		if groupName != "" {
+			title = groupName
+			body = fmt.Sprintf("%s: %s", senderName, bodyText)
+		} else {
+			title = fmt.Sprintf("Group: %s", senderName)
+			body = bodyText
+		}
+	} else {
+		senderName := a.resolveSenderName(v.Info.Sender, v.Info.PushName)
+		title = senderName
+		body = bodyText
+	}
+
+	avatarPath := a.getNotificationAvatar(v.Info.Chat, v.Info.Sender)
+	if err := beeep.Notify(title, body, avatarPath); err != nil {
 		log.Println("notify failed:", err)
 	}
+}
+
+// resolveAvatarPath returns the on-disk file path for a cached avatar, or "" if not found.
+func (a *Api) resolveAvatarPath(jid types.JID) string {
+	if a.imageCache == nil || jid.IsEmpty() {
+		return ""
+	}
+	// 1. Direct JID
+	if path := a.imageCache.GetAvatarAbsolutePath(jid.String()); path != "" {
+		return path
+	}
+	// 2. Canonical user JID
+	if a.waClient != nil {
+		canon := canonicalUserJID(a.ctx, a.waClient, jid)
+		if canon.String() != jid.String() {
+			if path := a.imageCache.GetAvatarAbsolutePath(canon.String()); path != "" {
+				return path
+			}
+		}
+		// 3. LID lookup
+		if jid.ActualAgent() == types.LIDDomain && a.waClient.Store != nil && a.waClient.Store.LIDs != nil {
+			if pn, err := a.waClient.Store.LIDs.GetPNForLID(a.ctx, jid); err == nil && !pn.IsEmpty() {
+				if path := a.imageCache.GetAvatarAbsolutePath(pn.String()); path != "" {
+					return path
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// getNotificationAvatar resolves the best avatar file path for a message notification.
+// Prefers group avatar for groups (falling back to sender avatar), and direct chat avatar for DMs.
+func (a *Api) getNotificationAvatar(chat types.JID, sender types.JID) string {
+	if a.imageCache == nil {
+		return ""
+	}
+	if chat.Server == types.GroupServer {
+		if path := a.resolveAvatarPath(chat); path != "" {
+			return path
+		}
+		if path := a.resolveAvatarPath(sender); path != "" {
+			return path
+		}
+		a.startBackground(func() {
+			_, _ = a.GetCachedAvatar(chat.String(), false)
+		})
+		return ""
+	}
+
+	target := chat
+	if target.IsEmpty() {
+		target = sender
+	}
+	if path := a.resolveAvatarPath(target); path != "" {
+		return path
+	}
+
+	if !target.IsEmpty() {
+		a.startBackground(func() {
+			_, _ = a.GetCachedAvatar(target.String(), false)
+		})
+	}
+	return ""
 }
 
 // NewApi creates a new Api application struct
@@ -277,6 +447,9 @@ func (a *Api) Startup(ctx context.Context) {
 		return
 	}
 	a.us.SetCommandHandler(a.trayCommandHandler)
+	a.us.SetOnHide(func() {
+		a.SetWindowFocused(false)
+	})
 	socketServer := a.us
 	go func() {
 		err := socketServer.ListenAndServe()
@@ -309,6 +482,30 @@ func (a *Api) Startup(ctx context.Context) {
 		return
 	}
 	a.waClient = wa.NewClient(ctx, container)
+	a.callManager = wa.NewCallManager(a.waClient, func(event string, data any) {
+		if a.ctx != nil {
+			runtime.EventsEmit(a.ctx, event, data)
+		}
+		if event == "wa:call_incoming" {
+			if a.ctx != nil {
+				runtime.WindowUnminimise(a.ctx)
+				runtime.Show(a.ctx)
+			}
+			callerName := "WhatsApp Contact"
+			avatarPath := ""
+			if m, ok := data.(map[string]any); ok {
+				if name, ok := m["peerName"].(string); ok && name != "" {
+					callerName = name
+				}
+				if jidStr, ok := m["peerJid"].(string); ok && jidStr != "" {
+					if parsed, err := types.ParseJID(jidStr); err == nil {
+						avatarPath = a.resolveAvatarPath(parsed)
+					}
+				}
+			}
+			_ = beeep.Notify("Incoming WhatsApp Call", fmt.Sprintf("Call from %s", callerName), avatarPath)
+		}
+	}, store.GetIncomingCallSoundsEnabled, store.GetOutgoingSoundsEnabled)
 	a.messageStore, err = store.NewMessageStore()
 	if err != nil {
 		a.failStartup(fmt.Errorf("open message store: %w", err))
@@ -384,6 +581,9 @@ func (a *Api) Login() error {
 			}
 		}
 	} else {
+		if client.Store.ID != nil && a.messageStore != nil {
+			a.messageStore.SetSelfUser(client.Store.ID.User)
+		}
 		// Already logged in, connect before announcing readiness.
 		err := client.Connect()
 		if err != nil {
@@ -405,24 +605,101 @@ func (a *Api) mainEventHandler(evt any) {
 	}
 	switch v := evt.(type) {
 	case *events.Message:
-		parsedHTML := a.processMessageText(v.Message)
+		unwrapped := store.UnwrapMessage(v.Message)
+		if unwrapped == nil {
+			return
+		}
 
-		// Handle message edits: re-parse the edited content
-		if protoMsg := v.Message.GetProtocolMessage(); protoMsg != nil && protoMsg.GetType() == waE2E.ProtocolMessage_MESSAGE_EDIT {
-			newContent := protoMsg.GetEditedMessage()
-			if newContent != nil {
-				parsedHTML = a.processMessageText(newContent)
+		var parsedHTML string
+		var isEditMessage bool
+		var editTargetID string
+		var editContent *waE2E.Message
+
+		// 1. Check SecretEncryptedMessage first (modern WhatsApp encrypted message edit)
+		var encMessage *waE2E.SecretEncryptedMessage
+		if unwrapped.GetSecretEncryptedMessage() != nil {
+			encMessage = unwrapped.GetSecretEncryptedMessage()
+		} else if v.RawMessage != nil && v.RawMessage.GetSecretEncryptedMessage() != nil {
+			encMessage = v.RawMessage.GetSecretEncryptedMessage()
+		}
+
+		if encMessage != nil && encMessage.GetSecretEncType() == waE2E.SecretEncryptedMessage_MESSAGE_EDIT {
+			if a.waClient != nil {
+				decrypted, err := a.waClient.DecryptSecretEncryptedMessage(a.ctx, v)
+				if err != nil {
+					log.Println("Failed to decrypt SecretEncryptedMessage edit:", err)
+				} else if decrypted != nil {
+					isEditMessage = true
+					if encMessage.GetTargetMessageKey() != nil {
+						editTargetID = encMessage.GetTargetMessageKey().GetID()
+					}
+					decryptedUnwrapped := store.UnwrapMessage(decrypted)
+					if protoMsg := decryptedUnwrapped.GetProtocolMessage(); protoMsg != nil && protoMsg.GetType() == waE2E.ProtocolMessage_MESSAGE_EDIT {
+						if protoMsg.GetKey() != nil && editTargetID == "" {
+							editTargetID = protoMsg.GetKey().GetID()
+						}
+						editContent = store.UnwrapMessage(protoMsg.GetEditedMessage())
+					} else {
+						editContent = decryptedUnwrapped
+					}
+					if editContent != nil {
+						parsedHTML = a.processMessageText(editContent)
+					}
+				}
 			}
 		}
 
-		messageID := a.messageStore.ProcessMessageEvent(a.ctx, a.waClient.Store.LIDs, v, parsedHTML)
+		// 2. Check ProtocolMessage MESSAGE_EDIT
+		if !isEditMessage {
+			if protoMsg := unwrapped.GetProtocolMessage(); protoMsg != nil && protoMsg.GetType() == waE2E.ProtocolMessage_MESSAGE_EDIT {
+				isEditMessage = true
+				if protoMsg.GetKey() != nil {
+					editTargetID = protoMsg.GetKey().GetID()
+				}
+				editContent = store.UnwrapMessage(protoMsg.GetEditedMessage())
+				if editContent != nil {
+					parsedHTML = a.processMessageText(editContent)
+				}
+			} else if v.RawMessage != nil {
+				if rawUnwrapped := store.UnwrapMessage(v.RawMessage); rawUnwrapped != nil {
+					if protoMsg := rawUnwrapped.GetProtocolMessage(); protoMsg != nil && protoMsg.GetType() == waE2E.ProtocolMessage_MESSAGE_EDIT {
+						isEditMessage = true
+						if protoMsg.GetKey() != nil {
+							editTargetID = protoMsg.GetKey().GetID()
+						}
+						editContent = store.UnwrapMessage(protoMsg.GetEditedMessage())
+						if editContent != nil {
+							parsedHTML = a.processMessageText(editContent)
+						}
+					}
+				}
+			}
+		}
+
+		if parsedHTML == "" {
+			if v.IsEdit {
+				isEditMessage = true
+			}
+			parsedHTML = a.processMessageText(unwrapped)
+		}
+
+		myUser := a.GetMyJID()
+		if myUser != "" && (v.Info.Sender.User == myUser || (!strings.Contains(v.Info.Chat.Server, "g.us") && v.Info.Chat.User == myUser)) {
+			v.Info.IsFromMe = true
+		}
+
+		messageID := a.messageStore.ProcessMessageEventWithEdit(a.ctx, a.waClient.Store.LIDs, v, parsedHTML, editTargetID, editContent)
 
 		// If a message was processed (inserted or updated), emit the decoded message from DB
 		if messageID != "" {
-			updatedMsg, err := a.messageStore.GetDecodedMessage(v.Info.Chat.String(), messageID)
+			chatJID := v.Info.Chat
+			if a.waClient != nil {
+				chatJID = canonicalUserJID(a.ctx, a.waClient, chatJID)
+			}
+			updatedMsg, err := a.messageStore.GetDecodedMessage(chatJID.String(), messageID)
 			if err == nil {
 				runtime.EventsEmit(a.ctx, "wa:new_message", map[string]any{
-					"chatId":      v.Info.Chat.String(),
+					"chatId":      chatJID.String(),
 					"message":     updatedMsg,
 					"messageText": parsedHTML, // Text field contains HTML now, but better than nothing or we can use updatedMsg.Text
 					"timestamp":   v.Info.Timestamp.Unix(),
@@ -439,9 +716,15 @@ func (a *Api) mainEventHandler(evt any) {
 		// Respects the global notification switch and per-chat mutes
 		// (including mutes synced from the phone).
 		isFeed := v.Info.Chat.Server == types.NewsletterServer || v.Info.Chat.Server == types.BroadcastServer
-		if messageID != "" && !v.Info.IsFromMe && !isFeed && v.Message.GetReactionMessage() == nil && !a.windowFocused.Load() &&
-			store.GetNotificationsEnabled() && !a.messageStore.IsChatMuted(v.Info.Chat.String()) {
-			a.startBackground(func() { a.notifyIncoming(v, parsedHTML) })
+		a.activeChatMu.RLock()
+		isActiveChat := a.isSameChat(a.activeChatId, v.Info.Chat)
+		a.activeChatMu.RUnlock()
+
+		isLookingAtChat := a.windowFocused.Load() && isActiveChat
+		if messageID != "" && !v.Info.IsFromMe && !isFeed && v.Message.GetReactionMessage() == nil &&
+			!isLookingAtChat && store.GetNotificationsEnabled() && !a.messageStore.IsChatMuted(v.Info.Chat.String()) &&
+			!a.messageStore.IsChatArchived(v.Info.Chat.String()) {
+			a.startBackground(func() { a.notifyIncoming(v, parsedHTML, isEditMessage) })
 		}
 
 		if reaction := v.Message.GetReactionMessage(); reaction != nil {
@@ -474,9 +757,24 @@ func (a *Api) mainEventHandler(evt any) {
 		}
 
 	case *events.Picture:
-		a.startBackground(func() { _, _ = a.GetCachedAvatar(v.JID.String(), true) })
-
-		runtime.EventsEmit(a.ctx, "wa:picture_update", v.JID.String())
+		targetJID := v.JID.String()
+		if v.Remove {
+			if a.imageCache != nil {
+				_ = a.imageCache.DeleteAvatar(targetJID)
+				if canon := canonicalUserJID(a.ctx, a.waClient, v.JID).String(); canon != targetJID {
+					_ = a.imageCache.DeleteAvatar(canon)
+				}
+			}
+			runtime.EventsEmit(a.ctx, "wa:picture_update", targetJID)
+		} else {
+			a.startBackground(func() {
+				_, _ = a.GetCachedAvatar(targetJID, true)
+				runtime.EventsEmit(a.ctx, "wa:picture_update", targetJID)
+				if canon := canonicalUserJID(a.ctx, a.waClient, v.JID).String(); canon != targetJID {
+					runtime.EventsEmit(a.ctx, "wa:picture_update", canon)
+				}
+			})
+		}
 
 	case *events.Mute:
 		// Emitted for mutes set on other devices (e.g. the phone), including
@@ -485,6 +783,9 @@ func (a *Api) mainEventHandler(evt any) {
 		a.handleMuteEvent(v.JID, muted, v.Action.GetMuteEndTimestamp())
 
 	case *events.Connected:
+		if a.waClient.Store.ID != nil && a.messageStore != nil {
+			a.messageStore.SetSelfUser(a.waClient.Store.ID.User)
+		}
 		// For new logins, there might be a problem where the whatsmeow client
 		// gets a 515 code which gets resolved internally by auto-reconnecting
 		// in a separate goroutine. In that case, the Initialise call below for
@@ -530,10 +831,28 @@ func (a *Api) mainEventHandler(evt any) {
 	case *events.Disconnected:
 		a.waClient.SendPresence(a.ctx, types.PresenceUnavailable)
 	case *events.Receipt:
-		runtime.EventsEmit(a.ctx, "wa:message_receipt", map[string]any{
-			"chatId": v.Chat.String(),
-			"status": v.Type.GoString(),
-		})
+		var status string
+		switch v.Type {
+		case types.ReceiptTypeRead, types.ReceiptTypeReadSelf, types.ReceiptTypePlayed, types.ReceiptTypePlayedSelf:
+			status = "read"
+		case types.ReceiptTypeDelivered, types.ReceiptTypeSender:
+			status = "delivered"
+		}
+
+		if status != "" && len(v.MessageIDs) > 0 {
+			msgIDs := make([]string, len(v.MessageIDs))
+			for i, id := range v.MessageIDs {
+				msgIDs[i] = string(id)
+			}
+			if a.messageStore != nil {
+				_ = a.messageStore.UpdateDeliveryStatus(msgIDs, status)
+			}
+			runtime.EventsEmit(a.ctx, "wa:message_receipt", map[string]any{
+				"chatId":     v.Chat.String(),
+				"messageIds": msgIDs,
+				"status":     status,
+			})
+		}
 	default:
 		// Ignore other events for now
 	}
@@ -573,11 +892,24 @@ func (a *Api) processHistorySync(v *events.HistorySync) {
 				continue
 			}
 			parsedHTML := a.processMessageText(parsedMsg.Message)
+			myUser := a.GetMyJID()
+			if myUser != "" && (parsedMsg.Info.Sender.User == myUser || (!strings.Contains(parsedMsg.Info.Chat.Server, "g.us") && parsedMsg.Info.Chat.User == myUser)) {
+				parsedMsg.Info.IsFromMe = true
+			}
 			if a.messageStore.ProcessMessageEvent(a.ctx, a.waClient.Store.LIDs, parsedMsg, parsedHTML) != "" {
 				stored++
 			}
 		}
 	}
 	log.Printf("History sync: stored %d messages from %d conversations", stored, len(conversations))
-	runtime.EventsEmit(a.ctx, "wa:chat_list_refresh")
+	a.emit("wa:chat_list_refresh")
 }
+
+func (a *Api) emit(event string, data ...any) {
+	if a.ctx == nil || a.ctx.Value("events") == nil {
+		return
+	}
+	runtime.EventsEmit(a.ctx, event, data...)
+}
+
+

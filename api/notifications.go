@@ -6,8 +6,8 @@ import (
 
 	"github.com/lugvitc/whats4linux/internal/store"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
-	"go.mau.fi/whatsmeow/appstate"
-	"go.mau.fi/whatsmeow/types"
+	"github.com/polymorfa/hypermeow/appstate"
+	"github.com/polymorfa/hypermeow/types"
 )
 
 // Systray socket protocol for the notifications toggle.
