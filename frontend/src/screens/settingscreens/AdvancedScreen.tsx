@@ -8,7 +8,6 @@ import {
 } from "../../../wailsjs/go/api/Api"
 
 import ComponentColorSelector from "../../components/settings/ComponentColorSelector"
-import EaseVisualizer from "../../components/settings/ComponentEaseSelector"
 
 const AdvancedScreen = () => {
   const [customCSS, setCustomCSS] = useState("")
@@ -60,7 +59,6 @@ const AdvancedScreen = () => {
   return (
     <>
       <ComponentColorSelector />
-      <EaseVisualizer />
       <CodeEditor
         title="Custom CSS"
         value={customCSS}

@@ -132,15 +132,20 @@ export function StoryViewer({ group, onClose }: { group: StatusGroup; onClose: (
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [idx, kind])
 
-  // Keyboard nav.
+  // Keyboard nav (capture-phase ESC so the underlying screen doesn't also receive Escape).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose()
-      else if (e.key === "ArrowRight") next()
-      else if (e.key === "ArrowLeft") prev()
+      if (e.key === "Escape") {
+        e.stopPropagation()
+        onClose()
+      } else if (e.key === "ArrowRight") {
+        next()
+      } else if (e.key === "ArrowLeft") {
+        prev()
+      }
     }
-    window.addEventListener("keydown", onKey)
-    return () => window.removeEventListener("keydown", onKey)
+    window.addEventListener("keydown", onKey, true)
+    return () => window.removeEventListener("keydown", onKey, true)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   })
 

@@ -13,12 +13,21 @@ interface UIStore {
   setChatInfoOpen: (open: boolean) => void
   setTypingIndicator: (chatId: string, isTyping: boolean) => void
   setOnlineStatus: (userId: string, isOnline: boolean) => void
-  addNotification: (message: string) => number
+  addNotification: (message: string, duration?: number) => number
   removeNotification: (id: number) => void
   lightboxSrc: string | null
   lightboxKind: "image" | "video"
   openLightbox: (src: string, kind?: "image" | "video") => void
   closeLightbox: () => void
+  activePdf: { src: string; title: string; messageId: string } | null
+  openPdf: (pdf: { src: string; title: string; messageId: string }) => void
+  closePdf: () => void
+  forwardingMessageId: string | null
+  openForwardModal: (messageId: string) => void
+  closeForwardModal: () => void
+  profileModalJid: string | null
+  openProfileModal: (jid: string) => void
+  closeProfileModal: () => void
 }
 
 export const useUIStore = create<UIStore>(set => ({
@@ -33,6 +42,18 @@ export const useUIStore = create<UIStore>(set => ({
   lightboxKind: "image",
   openLightbox: (src, kind = "image") => set({ lightboxSrc: src, lightboxKind: kind }),
   closeLightbox: () => set({ lightboxSrc: null }),
+
+  profileModalJid: null,
+  openProfileModal: jid => set({ profileModalJid: jid }),
+  closeProfileModal: () => set({ profileModalJid: null }),
+
+  activePdf: null,
+  openPdf: pdf => set({ activePdf: pdf }),
+  closePdf: () => set({ activePdf: null }),
+
+  forwardingMessageId: null,
+  openForwardModal: messageId => set({ forwardingMessageId: messageId }),
+  closeForwardModal: () => set({ forwardingMessageId: null }),
 
   toggleSidebar: () => set(state => ({ sidebarOpen: !state.sidebarOpen })),
   setSidebarOpen: open => set({ sidebarOpen: open }),
@@ -49,11 +70,18 @@ export const useUIStore = create<UIStore>(set => ({
       onlineStatus: { ...state.onlineStatus, [userId]: isOnline },
     })),
 
-  addNotification: message => {
-    const id = Date.now()
+  addNotification: (message, duration = 3500) => {
+    const id = Date.now() + Math.floor(Math.random() * 1000)
     set(state => ({
       notifications: [...state.notifications, { id, message }],
     }))
+    if (duration > 0) {
+      setTimeout(() => {
+        set(state => ({
+          notifications: state.notifications.filter(n => n.id !== id),
+        }))
+      }, duration)
+    }
     return id
   },
 

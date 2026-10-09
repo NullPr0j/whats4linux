@@ -25,6 +25,7 @@ type UnixSocket struct {
 	conn     net.Conn
 	listener net.Listener
 	handler  CommandHandler
+	onHide   func()
 	closed   bool
 }
 
@@ -40,6 +41,13 @@ func (s *UnixSocket) SetCommandHandler(handler CommandHandler) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.handler = handler
+}
+
+// SetOnHide registers a callback invoked when the window is hidden via the socket.
+func (s *UnixSocket) SetOnHide(fn func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onHide = fn
 }
 
 func (s *UnixSocket) ListenAndServe() error {
@@ -114,6 +122,12 @@ func (s *UnixSocket) handleConn(conn net.Conn) {
 			runtime.Show(s.ctx)
 		case "hide":
 			runtime.Hide(s.ctx)
+			s.mu.Lock()
+			onHide := s.onHide
+			s.mu.Unlock()
+			if onHide != nil {
+				onHide()
+			}
 		case "quit":
 			log.Println("Quit signal received from systray")
 			runtime.Quit(s.ctx)

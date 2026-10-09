@@ -16,7 +16,9 @@ export function QuotedMessage({
   const getContactColor = useContactStore(state => state.getContactColor)
   const quoted = contextInfo.quotedMessage
   // Quoting yourself shows "You" in green, like WhatsApp — no lookup needed.
-  const isSelf = !!contextInfo.participant && isMe(contextInfo.participant)
+  const isSelf =
+    (!contextInfo.participant && isMe(contextInfo.remoteJid)) ||
+    (!!contextInfo.participant && isMe(contextInfo.participant))
 
   useEffect(() => {
     const participant = contextInfo.participant

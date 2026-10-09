@@ -108,6 +108,30 @@ func notificationsEnabledFrom(data map[string]any) bool {
 	return true
 }
 
+// GetIncomingCallSoundsEnabled checks if incoming call sounds are enabled in settings.
+func GetIncomingCallSoundsEnabled() bool {
+	settingsInstance.mu.Lock()
+	defer settingsInstance.mu.Unlock()
+	if v, ok := settingsInstance.data["incomingCallSounds"]; ok {
+		if b, ok := v.(bool); ok {
+			return b
+		}
+	}
+	return true
+}
+
+// GetOutgoingSoundsEnabled checks if outgoing call sounds are enabled in settings.
+func GetOutgoingSoundsEnabled() bool {
+	settingsInstance.mu.Lock()
+	defer settingsInstance.mu.Unlock()
+	if v, ok := settingsInstance.data["outgoingSounds"]; ok {
+		if b, ok := v.(bool); ok {
+			return b
+		}
+	}
+	return true
+}
+
 // writeLocked persists the current settings map to disk. The caller must hold
 // settingsInstance.mu.
 func (s *settings) writeLocked() error {

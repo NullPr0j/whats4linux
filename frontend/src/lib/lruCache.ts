@@ -20,6 +20,14 @@ export class LRUCache<K, V> {
     return this.entries.has(key)
   }
 
+  delete(key: K): boolean {
+    const previous = this.entries.get(key)
+    if (!previous) return false
+    this.entries.delete(key)
+    this.totalWeight -= previous.weight
+    return true
+  }
+
   get(key: K): V | undefined {
     const entry = this.entries.get(key)
     if (!entry) return undefined

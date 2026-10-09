@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"go.mau.fi/whatsmeow/proto/waE2E"
+	"github.com/polymorfa/hypermeow/proto/waE2E"
 )
 
 // vcardTelRE pulls the first phone number out of a vCard payload.
@@ -192,6 +192,10 @@ func SpecialPreview(msg *waE2E.Message) (string, bool) {
 // chat row (poll votes, keep-in-chat markers, remaining protocol messages —
 // edits and revokes are handled before this check).
 func ShouldSkipMessage(msg *waE2E.Message) bool {
+	if msg == nil {
+		return true
+	}
+	msg = UnwrapMessage(msg)
 	if msg == nil {
 		return true
 	}

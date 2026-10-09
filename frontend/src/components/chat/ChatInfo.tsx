@@ -14,6 +14,9 @@ import { EventsOn } from "../../../wailsjs/runtime/runtime"
 import { GoBackIcon } from "../../assets/svgs/header_icons"
 import ToggleButton from "../settings/ToggleButton"
 import { useMuteStore } from "../../store/useMuteStore"
+import { useUIStore, useChatStore } from "../../store"
+import { ContactContextMenu } from "./ContactContextMenu"
+import { isMe } from "../../lib/self"
 
 interface ChatInfoProps {
   chatId: string
@@ -38,6 +41,14 @@ export function ChatInfo({
   const [showAllParticipants, setShowAllParticipants] = useState(false)
   const [muted, setMutedState] = useState(false)
   const [muteBusy, setMuteBusy] = useState(false)
+  const [contextMenu, setContextMenu] = useState<{
+    x: number
+    y: number
+    participant: any
+  } | null>(null)
+  const openLightbox = useUIStore(s => s.openLightbox)
+  const openProfileModal = useUIStore(s => s.openProfileModal)
+  const selectChat = useChatStore(s => s.selectChat)
   const MAX_VISIBLE = 10
 
   useEffect(() => {
@@ -160,7 +171,13 @@ export function ChatInfo({
           <>
             {/* Profile Section */}
             <div className="bg-light-secondary dark:bg-dark-secondary p-6 flex flex-col items-center">
-              <div className="w-32 h-32 rounded-full bg-gray-300 dark:bg-gray-600 flex items-center justify-center text-white font-bold text-4xl overflow-hidden mb-4">
+              <div
+                onClick={() => chatAvatar && openLightbox(chatAvatar, "image")}
+                className={`w-32 h-32 rounded-full bg-gray-300 dark:bg-gray-600 flex items-center justify-center text-white font-bold text-4xl overflow-hidden mb-4 ${
+                  chatAvatar ? "cursor-zoom-in hover:opacity-95 hover:ring-4 hover:ring-emerald-500/40 transition-all" : ""
+                }`}
+                title={chatAvatar ? "Click to view full photo" : ""}
+              >
                 {chatAvatar ? (
                   <img src={chatAvatar} alt={chatName} className="w-full h-full object-cover" />
                 ) : (
@@ -279,9 +296,30 @@ export function ChatInfo({
                   {visibleParticipants.map((participant: any) => (
                     <div
                       key={participant.contact.jid}
-                      className="flex items-center gap-3 p-3 rounded-xl m-2 hover:bg-gray-100 dark:hover:bg-dark-tertiary"
+                      onClick={() => openProfileModal(participant.contact.jid)}
+                      onContextMenu={e => {
+                        e.preventDefault()
+                        e.stopPropagation()
+                        setContextMenu({
+                          x: e.clientX,
+                          y: e.clientY,
+                          participant,
+                        })
+                      }}
+                      className="flex items-center gap-3 p-3 rounded-xl m-2 hover:bg-gray-100 dark:hover:bg-dark-tertiary cursor-pointer transition-colors"
                     >
-                      <div className="w-10 h-10 rounded-full bg-gray-300 dark:bg-gray-600 flex items-center justify-center text-white font-bold overflow-hidden">
+                      <div
+                        onClick={e => {
+                          if (participant.contact.avatar_url) {
+                            e.stopPropagation()
+                            openLightbox(participant.contact.avatar_url, "image")
+                          }
+                        }}
+                        className={`w-10 h-10 rounded-full bg-gray-300 dark:bg-gray-600 flex items-center justify-center text-white font-bold overflow-hidden ${
+                          participant.contact.avatar_url ? "cursor-zoom-in hover:ring-2 hover:ring-emerald-500/50" : ""
+                        }`}
+                        title={participant.contact.avatar_url ? "Click to view photo" : ""}
+                      >
                         {participant.contact.avatar_url ? (
                           <img
                             src={participant.contact.avatar_url}
@@ -293,17 +331,17 @@ export function ChatInfo({
                         )}
                       </div>
 
-                      <div className="flex-1">
-                        <p className="text-gray-900 dark:text-gray-100 font-medium">
+                      <div className="flex-1 min-w-0">
+                        <p className="text-gray-900 dark:text-gray-100 font-medium truncate">
                           {participant.contact.full_name || "~ " + participant.contact.push_name}
                         </p>
-                        <p className="text-sm text-gray-600 dark:text-gray-400">
+                        <p className="text-sm text-gray-600 dark:text-gray-400 truncate">
                           {participant.contact.phno}
                         </p>
                       </div>
 
                       {participant.is_admin && (
-                        <span className="text-xs px-3 py-1 rounded-full bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-[#C8ECC5]">
+                        <span className="text-xs px-3 py-1 rounded-full bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-[#C8ECC5] shrink-0">
                           Group admin
                         </span>
                       )}
@@ -322,7 +360,7 @@ export function ChatInfo({
               </div>
             )}
             {/* Block/Report (for contacts) */}
-            {chatType === "contact" && (
+            {chatType === "contact" && !isMe(chatId) && (
               <div className="mx-3 border-b border-gray-200 dark:border-dark-tertiary">
                 <button className="w-full p-4 flex items-center gap-3 hover:bg-gray-100 dark:hover:bg-dark-tertiary transition-colors text-red-600 dark:text-red-400">
                   <BlockIcon />
@@ -347,6 +385,44 @@ export function ChatInfo({
           </>
         )}
       </div>
+
+      {contextMenu && (
+        <ContactContextMenu
+          x={contextMenu.x}
+          y={contextMenu.y}
+          contactName={
+            contextMenu.participant.contact.full_name ||
+            contextMenu.participant.contact.push_name ||
+            contextMenu.participant.contact.phno
+          }
+          hasAvatar={!!contextMenu.participant.contact.avatar_url}
+          onClose={() => setContextMenu(null)}
+          onMessageDirectly={() => {
+            selectChat({
+              id: contextMenu.participant.contact.jid,
+              name:
+                contextMenu.participant.contact.full_name ||
+                contextMenu.participant.contact.push_name ||
+                contextMenu.participant.contact.phno,
+              avatar: contextMenu.participant.contact.avatar_url,
+            })
+            onClose()
+          }}
+          onViewProfile={() => {
+            openProfileModal(contextMenu.participant.contact.jid)
+          }}
+          onViewPhoto={
+            contextMenu.participant.contact.avatar_url
+              ? () => openLightbox(contextMenu.participant.contact.avatar_url, "image")
+              : undefined
+          }
+          onCopyPhone={() => {
+            navigator.clipboard.writeText(
+              contextMenu.participant.contact.phno || contextMenu.participant.contact.jid,
+            )
+          }}
+        />
+      )}
     </div>
   )
 }

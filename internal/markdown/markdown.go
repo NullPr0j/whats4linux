@@ -215,3 +215,28 @@ func MarkdownLinesToHTML(s string) string {
 	closeAll()
 	return out.String()
 }
+
+var (
+	brTagRE       = regexp.MustCompile(`(?i)<br\s*/?>`)
+	blockEndTagRE = regexp.MustCompile(`(?i)</(?:p|blockquote|li|div|h[1-6])>`)
+	allTagsRE     = regexp.MustCompile(`<[^>]*>`)
+)
+
+// HTMLToPlainText converts formatted HTML back into clean plain text,
+// stripping HTML tags, converting line breaks, and unescaping HTML entities.
+func HTMLToPlainText(s string) string {
+	if s == "" {
+		return ""
+	}
+	s = brTagRE.ReplaceAllString(s, "\n")
+	s = blockEndTagRE.ReplaceAllString(s, "\n")
+	s = allTagsRE.ReplaceAllString(s, "")
+	s = html.UnescapeString(s)
+
+	lines := strings.Split(s, "\n")
+	var cleaned []string
+	for _, l := range lines {
+		cleaned = append(cleaned, strings.TrimRight(l, "\r"))
+	}
+	return strings.Trim(strings.Join(cleaned, "\n"), "\n")
+}

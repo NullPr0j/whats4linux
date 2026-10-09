@@ -9,8 +9,6 @@ import PrivacySettingsScreen from "./settingscreens/PrivacySettingsScreen"
 import ChatsSettingsScreen from "./settingscreens/ChatsSettingsScreen"
 import NotificationsSettingsScreen from "./settingscreens/NotificationsSettingsScreen"
 import KeyBoardShortCuts from "./settingscreens/KeyBoardShortCuts"
-import HelpAndFeedback from "./settingscreens/HelpAndFeedback"
-import LogOut from "./settingscreens/LogOut"
 import AdvancedScreen from "./settingscreens/AdvancedScreen"
 import { useSelfAvatarStore } from "../store/useSelfAvatarStore.ts"
 import {
@@ -96,7 +94,11 @@ const settingsItems: SettingsItem[] = [
     label: "Help and feedback",
     description: "Help centre, contact us, privacy policy",
     icon: <HelpIcon />,
-    screen: <HelpAndFeedback />,
+    screen: (
+      <div className="text-sm text-gray-500 dark:text-gray-400">
+        Help and feedback options will be available in a future release.
+      </div>
+    ),
   },
   {
     id: "advanced",
@@ -110,7 +112,11 @@ const settingsItems: SettingsItem[] = [
     label: "Log out",
     danger: true,
     icon: <LogoutIcon />,
-    screen: <LogOut />,
+    screen: (
+      <div className="text-sm text-gray-500 dark:text-gray-400">
+        Log out is currently not supported. To reset your session, delete the app data directory.
+      </div>
+    ),
   },
 ]
 

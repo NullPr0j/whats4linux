@@ -1,4 +1,5 @@
 import { clsx, type ClassValue } from "clsx"
+import { isMe } from "./self"
 
 export function cn(...inputs: ClassValue[]) {
   return clsx(inputs)
@@ -253,4 +254,60 @@ export function dayKey(ts: string): string {
   } catch {
     return ""
   }
+}
+
+/**
+ * WhatsApp Edit Eligibility:
+ * 1. Sent by current user (isFromMe)
+ * 2. Not deleted
+ * 3. Not pending (already sent)
+ * 4. Text only (conversation or extendedTextMessage, NO media/polls/stickers)
+ * 5. Within WhatsApp's 15-minute window (15 * 60 seconds)
+ */
+export const WHATSAPP_EDIT_WINDOW_MS = 15 * 60 * 1000 // 15 minutes
+
+export function isMessageEditable(message: any): boolean {
+  if (!message) return false
+  const isFromMe = Boolean(
+    message.Info?.IsFromMe ??
+      message.isFromMe ??
+      (message.Info?.Sender && isMe(message.Info.Sender)) ??
+      (message.Info?.Chat && isMe(message.Info.Chat)),
+  )
+  if (!isFromMe) return false
+
+  const isDeleted = Boolean(message.is_deleted ?? message.IsDeleted)
+  if (isDeleted) return false
+
+  if (message.isPending) return false
+
+  const content = message.Content
+  if (!content) return false
+
+  // In WhatsApp, only text messages can be edited
+  const hasText = Boolean(content.conversation || content.extendedTextMessage?.text)
+  if (!hasText) return false
+
+  // Disallow media messages
+  if (
+    content.imageMessage ||
+    content.videoMessage ||
+    content.audioMessage ||
+    content.documentMessage ||
+    content.stickerMessage
+  ) {
+    return false
+  }
+
+  // 15-minute time window check
+  const ts = message.Info?.Timestamp
+  if (!ts) return false
+  const msgTime = new Date(ts).getTime()
+  if (isNaN(msgTime) || msgTime <= 0) return false
+
+  if (Date.now() - msgTime > WHATSAPP_EDIT_WINDOW_MS) {
+    return false
+  }
+
+  return true
 }

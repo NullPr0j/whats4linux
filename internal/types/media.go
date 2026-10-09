@@ -1,6 +1,6 @@
 package types
 
-import "go.mau.fi/whatsmeow"
+import "github.com/polymorfa/hypermeow"
 
 type MediaType uint8
 

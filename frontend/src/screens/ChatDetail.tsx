@@ -7,19 +7,24 @@ import {
   GetGroupInfo,
   GetProfile,
   MarkRead,
+  EditMessage,
+  DeleteMessage,
 } from "../../wailsjs/go/api/Api"
 import { store } from "../../wailsjs/go/models"
 import { EventsOn } from "../../wailsjs/runtime/runtime"
-import { useMessageStore, useUIStore, useChatStore } from "../store"
+import { useMessageStore, useUIStore, useChatStore, useCallStore, useDraftStore } from "../store"
+import { useAppSettingsStore } from "../store/useAppSettingsStore"
 import { MessageList, type MessageListHandle } from "../components/chat/MessageList"
 import { ChatHeader } from "../components/chat/ChatHeader"
 import { ChatInput } from "../components/chat/ChatInput"
 import { ChatInfo } from "../components/chat/ChatInfo"
+import { PdfPreviewPane } from "../components/chat/PdfPreviewPane"
+import { DeleteMessageModal } from "../components/chat/DeleteMessageModal"
 import clsx from "clsx"
-import { formatPhone } from "../lib/utils"
-import gsap from "gsap"
-import { useGSAP } from "@gsap/react"
-import { getEase } from "../store/useEaseStore"
+import { formatPhone, isMessageEditable } from "../lib/utils"
+import { useSelfAvatarStore } from "../store/useSelfAvatarStore"
+import { isMe } from "../lib/self"
+import { AttachIcon } from "../assets/svgs/chat_icons"
 
 interface ChatDetailProps {
   chatId: string
@@ -52,16 +57,30 @@ export function ChatDetail({ chatId, chatName, chatAvatar, onBack }: ChatDetailP
     addPendingMessage,
     updatePendingMessageToSent,
   } = useMessageStore()
-  const { setTypingIndicator, showEmojiPicker, setShowEmojiPicker, chatInfoOpen, setChatInfoOpen } =
-    useUIStore()
+  const {
+    setTypingIndicator,
+    showEmojiPicker,
+    setShowEmojiPicker,
+    chatInfoOpen,
+    setChatInfoOpen,
+    activePdf,
+    closePdf,
+  } = useUIStore()
   const { chatsById } = useChatStore()
+  const startCall = useCallStore(s => s.startCall)
+  const isGroup = chatId.endsWith("@g.us")
 
   const chatMessages = messages[chatId] || []
-  const [inputText, setInputText] = useState("")
+  const [inputText, setInputText] = useState(() => useDraftStore.getState().getDraft(chatId))
   const [pastedImage, setPastedImage] = useState<string | null>(null)
   const [selectedFile, setSelectedFile] = useState<File | null>(null)
   const [selectedFileType, setSelectedFileType] = useState<string>("")
   const [replyingTo, setReplyingTo] = useState<store.DecodedMessage | null>(null)
+  const [editingMessage, setEditingMessage] = useState<store.DecodedMessage | null>(null)
+  const [deleteTargetMessage, setDeleteTargetMessage] = useState<store.DecodedMessage | null>(null)
+  const [isDraggingOver, setIsDraggingOver] = useState(false)
+  const dragCounterRef = useRef(0)
+
   const [typingTimeout, setTypingTimeout] = useState<NodeJS.Timeout | null>(null)
 
   const [mentionableContacts, setMentionableContacts] = useState<any[]>([])
@@ -79,7 +98,6 @@ export function ChatDetail({ chatId, chatName, chatAvatar, onBack }: ChatDetailP
   const fileInputRef = useRef<HTMLInputElement>(null)
   const emojiPickerRef = useRef<HTMLDivElement>(null)
   const emojiButtonRef = useRef<HTMLButtonElement>(null)
-  const scrollButtonRef = useRef<HTMLButtonElement>(null)
   const sentMediaCache = useRef<Map<string, string>>(new Map())
   const isComposingRef = useRef(false)
   const requestGenerationRef = useRef(0)
@@ -89,11 +107,37 @@ export function ChatDetail({ chatId, chatName, chatAvatar, onBack }: ChatDetailP
   const initialLoadPromiseRef = useRef<Promise<void> | null>(null)
   const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  const easeShowRef = useRef(getEase("DropDown", "open"))
-  const easeHideRef = useRef(getEase("DropDown", "close"))
+  const focusComposer = useCallback(() => {
+    const focus = () => {
+      const el = textareaRef.current
+      if (el) {
+        el.focus()
+        const len = el.value.length
+        try {
+          el.setSelectionRange(len, len)
+        } catch {}
+      }
+    }
+    focus()
+    requestAnimationFrame(focus)
+    setTimeout(focus, 0)
+    setTimeout(focus, 50)
+    setTimeout(focus, 180)
+  }, [])
+
+  const handleCancelEdit = useCallback(() => {
+    setEditingMessage(null)
+    setInputText("")
+    focusComposer()
+  }, [focusComposer])
 
   const currentChat = chatsById.get(chatId)
   const chatType = currentChat?.type || "contact"
+  const selfAvatar = useSelfAvatarStore(s => s.selfAvatar)
+  const isSelf = isMe(chatId)
+  const effectiveChatName = isSelf ? "You" : chatName
+  const effectiveChatAvatar = isSelf ? (selfAvatar || chatAvatar) : chatAvatar
+
   const [chatSubtitle, setChatSubtitle] = useState("")
   const [pinnedMessages, setPinnedMessages] = useState<store.PinnedMessage[]>([])
   // Which pinned message the banner jumps to next (cycles like WhatsApp).
@@ -121,6 +165,11 @@ export function ChatDetail({ chatId, chatName, chatAvatar, onBack }: ChatDetailP
   const pinnedIds = useMemo(() => new Set(pinnedMessages.map(p => p.message_id)), [pinnedMessages])
 
   useEffect(() => {
+    if (isSelf) {
+      setChatSubtitle("Message yourself")
+      setMentionableContacts([])
+      return
+    }
     setChatSubtitle("")
     const loadMentionableContacts = async () => {
       if (chatType === "group") {
@@ -173,17 +222,40 @@ export function ChatDetail({ chatId, chatName, chatAvatar, onBack }: ChatDetailP
     textareaRef.current?.focus()
   }, [chatId])
 
-  // ESC: close overlays first (info panel, emoji picker, reply), then leave
+  useEffect(() => {
+    closePdf()
+  }, [chatId, closePdf])
+
+  // ESC: close overlays first (lightbox, PDF, delete dialog, info panel, emoji picker, edit, reply), then leave
   // the chat back to the list.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return
+      if (
+        useUIStore.getState().lightboxSrc ||
+        useUIStore.getState().forwardingMessageId ||
+        useUIStore.getState().profileModalJid
+      ) {
+        return
+      }
+      if (activePdf) {
+        closePdf()
+        return
+      }
+      if (deleteTargetMessage) {
+        setDeleteTargetMessage(null)
+        return
+      }
       if (chatInfoOpen) {
         setChatInfoOpen(false)
         return
       }
       if (showEmojiPicker) {
         setShowEmojiPicker(false)
+        return
+      }
+      if (editingMessage) {
+        handleCancelEdit()
         return
       }
       if (replyingTo) {
@@ -198,7 +270,7 @@ export function ChatDetail({ chatId, chatName, chatAvatar, onBack }: ChatDetailP
     }
     window.addEventListener("keydown", onKey)
     return () => window.removeEventListener("keydown", onKey)
-  }, [chatInfoOpen, showEmojiPicker, replyingTo, onBack, setChatInfoOpen, setShowEmojiPicker])
+  }, [activePdf, closePdf, deleteTargetMessage, chatInfoOpen, showEmojiPicker, editingMessage, handleCancelEdit, replyingTo, onBack, setChatInfoOpen, setShowEmojiPicker])
 
   const loadInitialMessages = useCallback(
     async (generation: number) => {
@@ -348,6 +420,7 @@ export function ChatDetail({ chatId, chatName, chatAvatar, onBack }: ChatDetailP
   const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const newValue = e.target.value
     setInputText(newValue)
+    useDraftStore.getState().setDraft(chatId, newValue)
     if (selectedMentions.length > 0) {
       setSelectedMentions(prev =>
         prev.filter(mention => {
@@ -379,7 +452,115 @@ export function ChatDetail({ chatId, chatName, chatAvatar, onBack }: ChatDetailP
     setTypingTimeout(timeout)
   }
 
+  const handleEdit = useCallback(
+    (msg: store.DecodedMessage) => {
+      if (!isMessageEditable(msg)) return
+      setEditingMessage(msg)
+      setReplyingTo(null)
+      const raw = msg.Content?.conversation || msg.Content?.extendedTextMessage?.text || ""
+      const plain = raw
+        .replace(/<br\s*[\/]?>/gi, "\n")
+        .replace(/<[^>]*>/g, "")
+        .replace(/&amp;/g, "&")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+      setInputText(plain)
+      focusComposer()
+    },
+    [focusComposer],
+  )
+
+  const handleReply = useCallback(
+    (msg: store.DecodedMessage) => {
+      setReplyingTo(msg)
+      setEditingMessage(null)
+      focusComposer()
+    },
+    [focusComposer],
+  )
+
+  useEffect(() => {
+    if (replyingTo || editingMessage) {
+      focusComposer()
+    }
+  }, [replyingTo, editingMessage, focusComposer])
+
+
+  const editMostRecentMessage = useCallback(() => {
+    for (let i = chatMessages.length - 1; i >= 0; i--) {
+      const msg = chatMessages[i]
+      if (isMessageEditable(msg)) {
+        handleEdit(msg)
+        return
+      }
+    }
+  }, [chatMessages, handleEdit])
+
+  useEffect(() => {
+    const handleGlobalKeyDown = (e: KeyboardEvent) => {
+      const activeEl = document.activeElement
+      const isOtherInput =
+        activeEl &&
+        activeEl !== textareaRef.current &&
+        (activeEl.tagName === "INPUT" || activeEl.tagName === "TEXTAREA")
+      if (isOtherInput) return
+
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault()
+        editMostRecentMessage()
+        return
+      }
+
+      if (e.altKey && !e.ctrlKey && !e.metaKey && e.key.toLowerCase() === "r") {
+        e.preventDefault()
+        if (chatMessages.length > 0) {
+          handleReply(chatMessages[chatMessages.length - 1])
+        }
+        return
+      }
+    }
+    window.addEventListener("keydown", handleGlobalKeyDown)
+    return () => window.removeEventListener("keydown", handleGlobalKeyDown)
+  }, [editMostRecentMessage, chatMessages, handleReply])
+
+  const handleDelete = useCallback((msg: store.DecodedMessage) => {
+    setDeleteTargetMessage(msg)
+  }, [])
+
+  const handleConfirmDelete = async (forEveryone: boolean) => {
+    if (!deleteTargetMessage) return
+    const msgId = deleteTargetMessage.Info.ID
+    setDeleteTargetMessage(null)
+    try {
+      if (!forEveryone) {
+        useMessageStore.getState().deleteMessage(chatId, msgId)
+      }
+      await DeleteMessage(chatId, msgId, forEveryone)
+    } catch (err) {
+      console.error("Failed to delete message:", err)
+    }
+  }
+
   const handleSendMessage = async () => {
+    if (editingMessage) {
+      const newText = inputText.trim()
+      const targetId = editingMessage.Info.ID
+      handleCancelEdit()
+      if (!newText) {
+        // Editing message to empty invokes delete it for everyone
+        DeleteMessage(chatId, targetId, true).catch(err => {
+          console.error("Failed to delete message for everyone on empty edit:", err)
+        })
+        return
+      }
+      EditMessage(chatId, targetId, newText).catch(err => {
+        console.error("Failed to edit message:", err)
+      })
+      return
+    }
+
     if (!inputText.trim() && !pastedImage && !selectedFile) return
 
     const textToSend = inputText
@@ -395,6 +576,7 @@ export function ChatDetail({ chatId, chatName, chatAvatar, onBack }: ChatDetailP
     const pendingMessage: any = {
       tempId,
       isPending: true,
+      delivery_status: "pending",
       Info: {
         ID: tempId,
         IsFromMe: true,
@@ -485,6 +667,7 @@ export function ChatDetail({ chatId, chatName, chatAvatar, onBack }: ChatDetailP
 
     // Clear input
     setInputText("")
+    useDraftStore.getState().clearDraft(chatId)
     setPastedImage(null)
     setSelectedFile(null)
     setReplyingTo(null)
@@ -570,6 +753,114 @@ export function ChatDetail({ chatId, chatName, chatAvatar, onBack }: ChatDetailP
     }
   }
 
+  const handleSendVoiceNote = async (base64Data: string, mimetype: string, durationSeconds: number) => {
+    const tempId = `temp-${Date.now()}-${Math.random()}`
+    const quotedMessageId = replyingTo?.Info.ID
+
+    const pendingMessage: any = {
+      tempId,
+      isPending: true,
+      delivery_status: "pending",
+      Info: {
+        ID: tempId,
+        IsFromMe: true,
+        Timestamp: new Date().toISOString(),
+        PushName: "You",
+        Sender: "",
+      },
+      Content: {
+        audioMessage: {
+          mimetype,
+          seconds: durationSeconds,
+          ptt: true,
+        },
+      },
+    }
+
+    if (quotedMessageId && replyingTo) {
+      pendingMessage.Content.audioMessage.contextInfo = {
+        quotedMessage: replyingTo.Content,
+        participant: replyingTo.Info.Sender,
+        stanzaId: replyingTo.Info.ID,
+      }
+    }
+
+    addPendingMessage(chatId, pendingMessage)
+    setReplyingTo(null)
+    if (!isAtBottom) scrollToBottom(false)
+
+    try {
+      await SendMessage(chatId, {
+        type: "audio",
+        clientTempId: tempId,
+        base64Data,
+        mimetype,
+        quotedMessageId,
+        ptt: true,
+        seconds: durationSeconds,
+      })
+    } catch (err) {
+      console.error("Failed to send voice note:", err)
+    }
+  }
+
+  const handleDragEnter = (e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    dragCounterRef.current++
+    if (e.dataTransfer.items && e.dataTransfer.items.length > 0) {
+      setIsDraggingOver(true)
+    }
+  }
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    dragCounterRef.current--
+    if (dragCounterRef.current <= 0) {
+      dragCounterRef.current = 0
+      setIsDraggingOver(false)
+    }
+  }
+
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+  }
+
+  const handleDrop = async (e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    dragCounterRef.current = 0
+    setIsDraggingOver(false)
+
+    const files = e.dataTransfer.files
+    if (!files || files.length === 0) return
+
+    const file = files[0]
+    const mime = file.type || ""
+
+    if (mime.startsWith("image/")) {
+      setSelectedFileType("image")
+      const reader = new FileReader()
+      reader.onload = ev => {
+        setPastedImage(ev.target?.result as string)
+      }
+      reader.readAsDataURL(file)
+    } else if (mime.startsWith("video/")) {
+      setSelectedFileType("video")
+      setSelectedFile(file)
+    } else if (mime.startsWith("audio/")) {
+      setSelectedFileType("audio")
+      setSelectedFile(file)
+    } else {
+      setSelectedFileType("document")
+      setSelectedFile(file)
+    }
+
+    focusComposer()
+  }
+
   useEffect(() => {
     const generation = ++requestGenerationRef.current
     loadingMoreRef.current = false
@@ -580,12 +871,19 @@ export function ChatDetail({ chatId, chatName, chatAvatar, onBack }: ChatDetailP
     setIsLoadingMore(false)
     setIsAtBottom(true)
     setActiveChatId(chatId)
+    setInputText(useDraftStore.getState().getDraft(chatId))
+    setPastedImage(null)
+    setSelectedFile(null)
+    setSelectedFileType("")
+    setReplyingTo(null)
+    setEditingMessage(null)
     const initialRequest = loadInitialMessages(generation)
     initialLoadPromiseRef.current = initialRequest
     void initialRequest.finally(() => {
       if (initialLoadPromiseRef.current === initialRequest) initialLoadPromiseRef.current = null
     })
     return () => {
+      setActiveChatId("")
       if (requestGenerationRef.current === generation) requestGenerationRef.current++
       loadingMoreRef.current = false
       loadMorePromiseRef.current = null
@@ -603,7 +901,11 @@ export function ChatDetail({ chatId, chatName, chatAvatar, onBack }: ChatDetailP
     const unsub = EventsOn(
       "wa:new_message",
       (data: { chatId: string; message: any; clientTempId?: string }) => {
-        if (data?.chatId === chatId && data.message?.Info?.ID) {
+        const isTargetChat =
+          data?.chatId === chatId ||
+          (Boolean(data?.chatId && chatId) &&
+            data.chatId.split("@")[0].split(":")[0] === chatId.split("@")[0].split(":")[0])
+        if (isTargetChat && data.message?.Info?.ID) {
           // Use getState to avoid depending on messages array and causing re-subscriptions
           const currentMessages = useMessageStore.getState().messages[chatId] || []
           const hasPendingMessage = currentMessages.some((m: any) => m.isPending)
@@ -621,47 +923,69 @@ export function ChatDetail({ chatId, chatName, chatAvatar, onBack }: ChatDetailP
                   ] = transient
                 }
               }
-              updatePendingMessageToSent(data.chatId, pending.tempId, data.message)
+              updatePendingMessageToSent(chatId, pending.tempId, data.message)
             } else {
-              updateMessage(data.chatId, data.message)
+              updateMessage(chatId, data.message)
             }
           } else {
-            updateMessage(data.chatId, data.message)
+            updateMessage(chatId, data.message)
           }
         }
       },
     )
 
-    return () => unsub()
-  }, [chatId, updateMessage, updatePendingMessageToSent])
+    const unsubReceipt = EventsOn(
+      "wa:message_receipt",
+      (data: { chatId: string; messageIds: string[]; status: string }) => {
+        if (data?.messageIds && data?.status) {
+          useMessageStore.getState().updateDeliveryStatus(data.chatId, data.messageIds, data.status)
+        }
+      },
+    )
 
-  useGSAP(() => {
-    if (!scrollButtonRef.current) return
+    const unsubDeleted = EventsOn(
+      "wa:message_deleted",
+      (data: { chatId: string; messageId: string }) => {
+        if (data?.messageId) {
+          useMessageStore.getState().deleteMessage(data.chatId, data.messageId)
+        }
+      },
+    )
 
-    if (isAtBottom) {
-      gsap.to(scrollButtonRef.current, {
-        opacity: 0,
-        duration: 0.3,
-        ease: easeHideRef.current,
-      })
-    } else {
-      gsap.to(scrollButtonRef.current, {
-        opacity: 1,
-        duration: 0.3,
-        ease: easeShowRef.current,
-      })
+    return () => {
+      unsub()
+      unsubReceipt()
+      unsubDeleted()
     }
-  }, [isAtBottom])
+  }, [chatId, updateMessage, updatePendingMessageToSent])
 
   return (
     <div className="flex h-full min-w-0">
-      <div className="flex flex-col flex-1 min-w-0">
+      <div
+        className="flex flex-col flex-1 min-w-0 relative"
+        onDragEnter={handleDragEnter}
+        onDragLeave={handleDragLeave}
+        onDragOver={handleDragOver}
+        onDrop={handleDrop}
+      >
+        {isDraggingOver && (
+          <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-black/60 backdrop-blur-sm pointer-events-none transition-all">
+            <div className="flex flex-col items-center justify-center rounded-2xl border-2 border-dashed border-[#00a884] bg-white/10 dark:bg-black/50 p-8 shadow-2xl">
+              <div className="mb-3 rounded-full bg-[#00a884]/20 p-4 text-[#00a884]">
+                <AttachIcon />
+              </div>
+              <p className="text-lg font-medium text-white">Drop files here</p>
+              <p className="mt-1 text-sm text-gray-300">Add to message as attachment</p>
+            </div>
+          </div>
+        )}
         <ChatHeader
-          chatName={chatName}
+          chatName={effectiveChatName}
           chatSubtitle={chatSubtitle}
-          chatAvatar={chatAvatar}
+          chatAvatar={effectiveChatAvatar}
           onBack={onBack}
           onInfoClick={() => setChatInfoOpen(!chatInfoOpen)}
+          onCallClick={!isGroup && !isSelf ? () => startCall(chatId, effectiveChatName) : undefined}
         />
 
         {/* Pinned-messages banner: shows the latest pin, click cycles through
@@ -708,10 +1032,19 @@ export function ChatDetail({ chatId, chatName, chatAvatar, onBack }: ChatDetailP
             </div>
           )}
 
+          {activePdf && (
+            <div className="absolute inset-0 z-40 bg-white dark:bg-[#111b21]">
+              <PdfPreviewPane pdf={activePdf} onClose={closePdf} />
+            </div>
+          )}
+
           <button
-            ref={scrollButtonRef}
             onClick={() => scrollToBottom(false)}
-            className="absolute bottom-4 right-8 bg-white dark:bg-received-bubble-dark-bg p-2 rounded-full shadow-lg border border-gray-200 dark:border-gray-700 z-100 hover:bg-gray-100 dark:hover:bg-[#2a3942]"
+            aria-label="Scroll to bottom"
+            className={clsx(
+              "absolute bottom-4 right-8 bg-white dark:bg-received-bubble-dark-bg p-2 rounded-full shadow-lg border border-gray-200 dark:border-gray-700 z-100 hover:bg-gray-100 dark:hover:bg-[#2a3942] transition-opacity duration-300",
+              isAtBottom ? "opacity-0 pointer-events-none" : "opacity-100"
+            )}
           >
             <svg
               viewBox="0 0 24 24"
@@ -731,7 +1064,9 @@ export function ChatDetail({ chatId, chatName, chatAvatar, onBack }: ChatDetailP
               messages={chatMessages}
               firstItemIndex={firstItemIndex}
               sentMediaCache={sentMediaCache}
-              onReply={setReplyingTo}
+              onReply={handleReply}
+              onEdit={handleEdit}
+              onDelete={handleDelete}
               onQuotedClick={handleQuotedClick}
               onLoadMore={() => void loadMoreMessages()}
               onAtBottomChange={handleAtBottomChange}
@@ -754,11 +1089,48 @@ export function ChatDetail({ chatId, chatName, chatAvatar, onBack }: ChatDetailP
           emojiPickerRef={emojiPickerRef}
           emojiButtonRef={emojiButtonRef}
           replyingTo={replyingTo}
+          editingMessage={editingMessage}
           mentionableContacts={mentionableContacts}
           onInputChange={handleInputChange}
-          onKeyDown={e =>
-            e.key === "Enter" && !e.shiftKey && (e.preventDefault(), handleSendMessage())
-          }
+          onKeyDown={e => {
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault()
+              handleSendMessage()
+              return
+            }
+            if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+              e.preventDefault()
+              editMostRecentMessage()
+              return
+            }
+            if (e.key === "ArrowUp" && !inputText && !editingMessage) {
+              e.preventDefault()
+              editMostRecentMessage()
+              return
+            }
+            if (e.altKey && !e.ctrlKey && !e.metaKey && e.key.toLowerCase() === "r") {
+              e.preventDefault()
+              if (chatMessages.length > 0) {
+                handleReply(chatMessages[chatMessages.length - 1])
+              }
+              return
+            }
+            if (e.key === "Escape") {
+              if (editingMessage) {
+                e.preventDefault()
+                e.stopPropagation()
+                handleCancelEdit()
+                return
+              }
+              if (replyingTo) {
+                e.preventDefault()
+                e.stopPropagation()
+                setReplyingTo(null)
+                focusComposer()
+                return
+              }
+            }
+          }}
           onPaste={async e => {
             // Chromium exposes pasted images synchronously via DataTransfer.
             const items = e.clipboardData?.items
@@ -808,23 +1180,44 @@ export function ChatDetail({ chatId, chatName, chatAvatar, onBack }: ChatDetailP
             setPastedImage(null)
           }}
           onEmojiClick={emoji => {
-            setInputText(prev => prev + emoji)
+            setInputText(prev => {
+              const next = prev + emoji
+              useDraftStore.getState().setDraft(chatId, next)
+              return next
+            })
             setShowEmojiPicker(false)
           }}
           onToggleEmojiPicker={() => setShowEmojiPicker(!showEmojiPicker)}
-          onCancelReply={() => setReplyingTo(null)}
+          onCancelReply={() => {
+            setReplyingTo(null)
+            focusComposer()
+          }}
+          onCancelEdit={handleCancelEdit}
           onMentionAdd={contact => setSelectedMentions(prev => [...prev, contact])}
           selectedMentions={selectedMentions}
+          onSendVoiceNote={handleSendVoiceNote}
         />
       </div>
 
       <ChatInfo
         chatId={chatId}
-        chatName={chatName}
+        chatName={effectiveChatName}
         chatType={chatType}
-        chatAvatar={chatAvatar}
+        chatAvatar={effectiveChatAvatar}
         isOpen={chatInfoOpen}
         onClose={() => setChatInfoOpen(false)}
+      />
+
+      <DeleteMessageModal
+        isOpen={!!deleteTargetMessage}
+        isFromMe={Boolean(
+          deleteTargetMessage?.Info.IsFromMe ||
+            (deleteTargetMessage?.Info.Sender && isMe(deleteTargetMessage.Info.Sender)) ||
+            isMe(chatId),
+        )}
+        onClose={() => setDeleteTargetMessage(null)}
+        onDeleteForEveryone={() => handleConfirmDelete(true)}
+        onDeleteForMe={() => handleConfirmDelete(false)}
       />
     </div>
   )

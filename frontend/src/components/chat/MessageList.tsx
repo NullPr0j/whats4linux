@@ -18,6 +18,8 @@ interface MessageListProps {
   firstItemIndex: number
   sentMediaCache: React.MutableRefObject<Map<string, string>>
   onReply?: (message: store.DecodedMessage) => void
+  onEdit?: (message: store.DecodedMessage) => void
+  onDelete?: (message: store.DecodedMessage) => void
   onQuotedClick?: (messageId: string) => void
   onLoadMore?: () => void
   onAtBottomChange?: (atBottom: boolean) => void
@@ -72,6 +74,8 @@ export const MessageList = forwardRef<MessageListHandle, MessageListProps>(funct
     firstItemIndex,
     sentMediaCache,
     onReply,
+    onEdit,
+    onDelete,
     onQuotedClick,
     onLoadMore,
     onAtBottomChange,
@@ -167,6 +171,8 @@ export const MessageList = forwardRef<MessageListHandle, MessageListProps>(funct
               pinnedIds={pinnedIds}
               sentMediaCache={sentMediaCache}
               onReply={onReply}
+              onEdit={onEdit}
+              onDelete={onDelete}
               onQuotedClick={onQuotedClick}
               highlightedMessageId={highlightedMessageId}
             />

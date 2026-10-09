@@ -11,7 +11,7 @@ import (
 	"github.com/lugvitc/whats4linux/internal/misc"
 	"github.com/lugvitc/whats4linux/internal/query"
 
-	"go.mau.fi/whatsmeow"
+	"github.com/polymorfa/hypermeow"
 )
 
 type AppDatabase struct {

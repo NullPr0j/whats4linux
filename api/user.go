@@ -2,10 +2,11 @@ package api
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/nyaruka/phonenumbers"
-	"go.mau.fi/whatsmeow"
-	"go.mau.fi/whatsmeow/types"
+	"github.com/polymorfa/hypermeow"
+	"github.com/polymorfa/hypermeow/types"
 )
 
 // GetMyJID returns the logged-in user's phone-number part, used to identify
@@ -32,7 +33,13 @@ func (a *Api) GetProfile(jidStr string) (Contact, error) {
 		}
 	}
 
-	contact, _ := a.waClient.Store.Contacts.GetContact(a.ctx, targetJID.ToNonAD())
+	if a.waClient != nil {
+		targetJID = canonicalUserJID(a.ctx, a.waClient, targetJID)
+	} else {
+		targetJID = targetJID.ToNonAD()
+	}
+
+	contact, _ := a.waClient.Store.Contacts.GetContact(a.ctx, targetJID)
 	rawNum := "+" + targetJID.User
 
 	jid := rawNum
@@ -41,12 +48,32 @@ func (a *Api) GetProfile(jidStr string) (Contact, error) {
 		jid = phonenumbers.Format(num, phonenumbers.INTERNATIONAL)
 	}
 
-	pic, _ := a.waClient.GetProfilePictureInfo(a.ctx, targetJID, &whatsmeow.GetProfilePictureParams{
-		Preview: true,
-	})
 	var avatarURL string
-	if pic != nil {
-		avatarURL = pic.URL
+	if a.imageCache != nil {
+		if cached, err := a.GetCachedAvatar(targetJID.String(), false); err == nil && cached != "" {
+			avatarURL = cached
+		}
+	}
+
+	if avatarURL == "" {
+		pic, _ := a.waClient.GetProfilePictureInfo(a.ctx, targetJID, &whatsmeow.GetProfilePictureParams{
+			Preview: true,
+		})
+		if pic != nil {
+			avatarURL = pic.URL
+		}
+	}
+
+	if jidStr != "" && a.waClient != nil && a.waClient.Store != nil && a.waClient.Store.ID != nil && targetJID.User == a.waClient.Store.ID.User && !strings.Contains(targetJID.Server, "g.us") {
+		return Contact{
+			Phno:       jid,
+			JID:        targetJID.String(),
+			FullName:   "You",
+			Short:      "You",
+			PushName:   "Message yourself",
+			IsBusiness: false,
+			AvatarURL:  avatarURL,
+		}, nil
 	}
 
 	pushName := contact.PushName

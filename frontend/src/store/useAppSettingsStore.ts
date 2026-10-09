@@ -1,8 +1,7 @@
 import { create } from "zustand"
 import { GetSettings, SaveSettings } from "../../wailsjs/go/api/Api"
-import { DEFAULT_EASES, THEME, applyThemeColors } from "../theme.config"
+import { THEME, applyThemeColors } from "../theme.config"
 import { cacheTheme, normalizeTheme, readCachedTheme } from "../lib/theme"
-import { useEaseStore } from "./useEaseStore"
 
 interface AppSettingsStore extends AppSettings {
   loaded: boolean
@@ -17,10 +16,8 @@ export interface AppSettings {
   // Theme
   theme: "light" | "dark"
   themeColors: typeof THEME
-  eases: typeof DEFAULT_EASES
 
   // Privacy Settings
-  readReceipts: boolean
   blockUnknown: boolean
   disableLinkPreviews: boolean
 
@@ -39,6 +36,7 @@ export interface AppSettings {
   minimizeToTray: boolean
   language: string
   fontSize: string
+  downloadDir: string
 
   // Chats Settings
   spellCheck: boolean
@@ -49,8 +47,6 @@ export interface AppSettings {
 const defaultSettings: AppSettings = {
   theme: "light",
   themeColors: THEME,
-  eases: DEFAULT_EASES,
-  readReceipts: true,
   blockUnknown: false,
   disableLinkPreviews: false,
 
@@ -67,6 +63,7 @@ const defaultSettings: AppSettings = {
   minimizeToTray: true,
   language: "English",
   fontSize: "100% (Default)",
+  downloadDir: "",
 
   spellCheck: true,
   replaceTextWithEmojis: true,
@@ -104,7 +101,6 @@ export const useAppSettingsStore = create<AppSettingsStore>((set, get) => ({
       }
 
       applyThemeColors(merged.themeColors)
-      useEaseStore.setState({ eases: merged.eases })
       cacheTheme(merged.theme)
 
       set({
@@ -115,7 +111,6 @@ export const useAppSettingsStore = create<AppSettingsStore>((set, get) => ({
       // fallback to defaults, but keep the locally cached theme so a backend
       // failure does not flip a dark-mode user back to light
       applyThemeColors(defaultSettings.themeColors)
-      useEaseStore.setState({ eases: defaultSettings.eases })
 
       set({ theme: readCachedTheme(), loaded: true })
     }

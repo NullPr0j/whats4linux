@@ -1,88 +1,67 @@
 package cmd
 
 import (
+	"flag"
 	"fmt"
 	"io/fs"
 	"runtime"
-
-	"github.com/lugvitc/whats4linux/cmd/common"
-	"github.com/urfave/cli"
 )
 
 const APP_NAME = "whats4linux"
 
-// BuildArgs contains build-time information passed to the CLI application.
-// These values are typically injected during the build process via ldflags
-// and are used to display version and build information to users.
+// BuildArgs contains build-time information passed to the application.
 type BuildArgs struct {
-	// Version is the semantic version of the application.
-	Version string
-	// BuildType indicates the build variant (e.g., "release", "debug", "snapshot").
+	Version   string
 	BuildType string
-	// Date is the build timestamp in a human-readable format.
-	Date string
-	// Commit is the git commit hash from which the build was created.
-	Commit string
-}
-
-var currentBuildArgs BuildArgs
-
-var versionCmdStr string
-
-func GetApp(assets fs.FS, bArgs BuildArgs) *cli.App {
-	// Build the base commands
-	commands := []cli.Command{
-		{
-			Name:    "help",
-			Aliases: []string{"h"},
-			Usage:   "prints the help message",
-			Action:  common.Help,
-		},
-		{
-			Name:               "version",
-			Aliases:            []string{"v"},
-			Usage:              "prints installed version",
-			UsageText:          " ",
-			CustomHelpTemplate: CMD_HELP_TEMPL,
-			Action:             common.GetVersion,
-		},
-	}
-
-	return &cli.App{
-		Name:                   APP_NAME,
-		HelpName:               APP_NAME,
-		Usage:                  "An unofficial WhatsApp client.",
-		Version:                fmt.Sprintf("%s-%s", bArgs.Version, bArgs.BuildType),
-		UsageText:              "whats4linux <command> [arguments...]",
-		Description:            DESCRIPTION,
-		CustomAppHelpTemplate:  HELP_TEMPL,
-		OnUsageError:           common.UsageErrorCallback,
-		Commands:               commands,
-		Action:                 run(assets),
-		UseShortOptionHandling: true,
-		HideHelp:               true,
-		HideVersion:            true,
-	}
+	Date      string
+	Commit    string
 }
 
 func Execute(args []string, assets fs.FS, bArgs BuildArgs) error {
-	// Store build args for use by daemon and other commands
-	currentBuildArgs = bArgs
-
-	// Get the configured CLI application
-	app := GetApp(assets, bArgs)
-
-	// Set the version command string for global use
-	common.VersionCmdStr = fmt.Sprintf("%s %s (%s_%s)\n",
-		app.Name,
-		app.Version,
-		runtime.GOOS,
-		runtime.GOARCH,
-	)
-
-	if bArgs.Commit != "" && bArgs.Date != "" {
-		common.VersionCmdStr += fmt.Sprintf("Build: %s=%s\n", bArgs.Date, bArgs.Commit)
+	fsFlags := flag.NewFlagSet(APP_NAME, flag.ContinueOnError)
+	fsFlags.Usage = func() {
+		fmt.Printf("Usage: %s [flags]\n\nAn unofficial WhatsApp client for Linux.\n\nFlags:\n", APP_NAME)
+		fsFlags.PrintDefaults()
 	}
 
-	return app.Run(args)
+	showHelp := fsFlags.Bool("help", false, "prints the help message")
+	fsFlags.BoolVar(showHelp, "h", false, "prints the help message")
+	showVersion := fsFlags.Bool("version", false, "prints installed version")
+	fsFlags.BoolVar(showVersion, "v", false, "prints installed version")
+
+	if len(args) > 1 {
+		switch args[1] {
+		case "version", "v":
+			printVersion(bArgs)
+			return nil
+		case "help", "h":
+			fsFlags.Usage()
+			return nil
+		}
+	}
+
+	if len(args) > 1 {
+		if err := fsFlags.Parse(args[1:]); err != nil {
+			return err
+		}
+	}
+
+	if *showHelp {
+		fsFlags.Usage()
+		return nil
+	}
+
+	if *showVersion {
+		printVersion(bArgs)
+		return nil
+	}
+
+	return run(assets)
+}
+
+func printVersion(bArgs BuildArgs) {
+	fmt.Printf("%s %s-%s (%s_%s)\n", APP_NAME, bArgs.Version, bArgs.BuildType, runtime.GOOS, runtime.GOARCH)
+	if bArgs.Commit != "" && bArgs.Date != "" {
+		fmt.Printf("Build: %s=%s\n", bArgs.Date, bArgs.Commit)
+	}
 }

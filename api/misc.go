@@ -7,7 +7,7 @@ import (
 	"github.com/lugvitc/whats4linux/internal/misc"
 	"github.com/lugvitc/whats4linux/internal/settings"
 	"github.com/lugvitc/whats4linux/internal/store"
-	"go.mau.fi/whatsmeow/types"
+	"github.com/polymorfa/hypermeow/types"
 )
 
 func (a *Api) GetJIDUser(jid types.JID) string {

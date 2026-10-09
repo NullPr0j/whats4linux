@@ -1,8 +1,9 @@
 import { create } from "zustand"
 import { useShallow } from "zustand/react/shallow"
-import { useCallback } from "react"
+import { useCallback, useMemo } from "react"
 import type { ChatItem } from "./types"
 import { sortChatItems } from "../lib/chatSort"
+import { useCategoryStore } from "./useCategoryStore"
 
 interface ChatStore {
   // Use a Map for O(1) lookups and granular updates
@@ -28,6 +29,7 @@ interface ChatStore {
   resortChats: () => void
   incrementUnreadCount: (chatId: string) => void
   clearUnreadCount: (chatId: string) => void
+  addChat: (chat: ChatItem) => void
   getChat: (chatId: string) => ChatItem | undefined
 }
 
@@ -87,18 +89,38 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       return { chatsById: newChatsById }
     }),
 
+  addChat: chat =>
+    set(state => {
+      const existing = state.chatsById.get(chat.id)
+      const merged = existing ? { ...existing, ...chat } : chat
+      const newChatsById = new Map(state.chatsById)
+      newChatsById.set(chat.id, merged)
+      const newChatIds = sortChatItems([...newChatsById.values()]).map(c => c.id)
+      return { chatsById: newChatsById, chatIds: newChatIds }
+    }),
+
   updateChatLastMessage: (chatId, message, timestamp, sender) =>
     set(state => {
       const existingChat = state.chatsById.get(chatId)
-      if (!existingChat) return state
-
       const newChatsById = new Map(state.chatsById)
-      newChatsById.set(chatId, {
-        ...existingChat,
-        subtitle: message,
-        timestamp: timestamp || Date.now(),
-        sender: sender !== undefined ? sender : existingChat.sender,
-      })
+
+      if (existingChat) {
+        newChatsById.set(chatId, {
+          ...existingChat,
+          subtitle: message,
+          timestamp: timestamp || Date.now(),
+          sender: sender !== undefined ? sender : existingChat.sender,
+        })
+      } else {
+        newChatsById.set(chatId, {
+          id: chatId,
+          name: sender || chatId.split("@")[0].split(":")[0],
+          subtitle: message,
+          type: chatId.endsWith("@g.us") ? "group" : "contact",
+          timestamp: timestamp || Date.now(),
+          sender,
+        })
+      }
 
       // Re-sort: keeps pinned chats above even when another chat gets a
       // new message.
@@ -145,8 +167,15 @@ export const useChatIds = () => {
   return useChatStore(useShallow((state: ChatStore) => state.chatIds))
 }
 
-// Selector for filtered chat IDs based on search and archive view.
+// Selector for filtered chat IDs based on search, archive view, and active category.
 export const useFilteredChatIds = (showArchived = false) => {
+  const activeCategoryId = useCategoryStore(state => state.activeCategoryId)
+  const categories = useCategoryStore(state => state.categories)
+  const activeCategory = useMemo(
+    () => categories.find(c => c.id === activeCategoryId),
+    [categories, activeCategoryId],
+  )
+
   return useChatStore(
     useShallow((state: ChatStore) => {
       const { chatIds, chatsById, searchTerm } = state
@@ -156,7 +185,17 @@ export const useFilteredChatIds = (showArchived = false) => {
         const chat = chatsById.get(id)
         if (!chat) return false
         if (!!chat.archived !== showArchived) return false
-        return !term || chat.name.toLowerCase().includes(term)
+        if (term && !chat.name.toLowerCase().includes(term)) return false
+
+        if (showArchived) return true
+
+        if (activeCategoryId === "all") return true
+        if (activeCategoryId === "unread") return (chat.unreadCount ?? 0) > 0
+        if (activeCategoryId === "groups") return chat.type === "group" || id.endsWith("@g.us")
+        if (activeCategory) {
+          return activeCategory.chatIds.includes(id)
+        }
+        return true
       })
     }),
   )

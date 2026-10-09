@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/lugvitc/whats4linux/internal/wa"
-	"go.mau.fi/whatsmeow/types"
+	"github.com/polymorfa/hypermeow/types"
 )
 
 type Group struct {

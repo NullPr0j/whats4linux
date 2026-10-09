@@ -15,8 +15,7 @@ export default defineConfig({
         manualChunks(id) {
           if (!id.includes("node_modules")) return
           if (id.includes("@emoji-mart")) return "emoji"
-          if (id.includes("gsap")) return "animation"
-          if (id.includes("zustand") || id.includes("immer")) return "state"
+          if (id.includes("zustand")) return "state"
           if (id.includes("react-virtuoso") || id.includes("react-resizable-panels")) {
             return "ui"
           }

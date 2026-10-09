@@ -1,8 +1,13 @@
-import gsap from "gsap"
-import { useGSAP } from "@gsap/react"
 import { useState, useRef, useEffect } from "react"
 import clsx from "clsx"
-import { getEase } from "../../store/useEaseStore"
+
+interface DropDownProps {
+  title: string
+  elements: string[]
+  icon?: React.ReactNode
+  onToggle: (element: string) => void
+  placeholder?: string
+}
 
 const DropDown = ({
   title,
@@ -10,32 +15,10 @@ const DropDown = ({
   icon,
   onToggle,
   placeholder = "Select an option",
-}: {
-  title: string
-  elements: string[]
-  icon?: React.ReactNode
-  onToggle: (element: string) => void
-  placeholder?: string
-}) => {
+}: DropDownProps) => {
   const [onOpen, setOnOpen] = useState(false)
   const [selectedElement, setSelectedElement] = useState<string | null>(null)
-  const dropdownRef = useRef<HTMLDivElement>(null)
-  const arrowRef = useRef<HTMLSpanElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
-
-  const easeOpenRef = useRef(getEase("DropDown", "open"))
-  const easeCloseRef = useRef(getEase("DropDown", "close"))
-  const easeRotateRef = useRef(getEase("DropDown", "rotate"))
-
-  useEffect(() => {
-    easeOpenRef.current = getEase("DropDown", "open")
-    easeCloseRef.current = getEase("DropDown", "close")
-    easeRotateRef.current = getEase("DropDown", "rotate")
-  })
-
-  const toggleOpen = () => {
-    setOnOpen(!onOpen)
-  }
 
   const handleSelect = (element: string) => {
     setSelectedElement(element)
@@ -53,63 +36,33 @@ const DropDown = ({
     if (onOpen) {
       document.addEventListener("mousedown", handleClickOutside)
     }
-
     return () => {
       document.removeEventListener("mousedown", handleClickOutside)
     }
   }, [onOpen])
 
-  useGSAP(() => {
-    if (!dropdownRef.current || !arrowRef.current) return
-
-    if (onOpen) {
-      gsap.set(dropdownRef.current, { height: "auto" })
-      const h = dropdownRef.current.offsetHeight
-
-      gsap.fromTo(
-        dropdownRef.current,
-        { height: 0, opacity: 0 },
-        { height: h, opacity: 1, duration: 0.3, ease: easeOpenRef.current },
-      )
-
-      gsap.to(arrowRef.current, {
-        rotation: 180,
-        duration: 0.3,
-        ease: easeRotateRef.current,
-      })
-    } else {
-      gsap.to(dropdownRef.current, {
-        height: 0,
-        opacity: 0,
-        duration: 0.3,
-        ease: easeCloseRef.current,
-      })
-
-      gsap.to(arrowRef.current, {
-        rotation: 0,
-        duration: 0.3,
-        ease: easeRotateRef.current,
-      })
-    }
-  }, [onOpen])
-
   return (
-    <div ref={containerRef} className="flex flex-col">
+    <div ref={containerRef} className="flex flex-col relative">
       <div className="font-semibold mb-2">{title}</div>
       <div
         className="bg-dropdown-bg dark:bg-dropdown-dark-bg cursor-pointer flex items-center justify-between p-2 hover:bg-dropdown-hover-bg dark:hover:bg-dropdown-dark-hover-bg rounded-md transition-colors border border-dropdown-border dark:border-dropdown-dark-border text-dropdown-text dark:text-dropdown-dark-text"
-        onClick={toggleOpen}
+        onClick={() => setOnOpen(v => !v)}
       >
         <div className="flex items-center gap-2">
           {icon}
           <span>{selectedElement || placeholder}</span>
         </div>
-        <span ref={arrowRef} className="inline-block">
+        <span
+          className={clsx(
+            "inline-block transition-transform duration-200 text-xs",
+            onOpen ? "rotate-180" : "rotate-0",
+          )}
+        >
           ▼
         </span>
       </div>
-      <div ref={dropdownRef} className="overflow-hidden" style={{ height: 0, opacity: 0 }}>
-        <div className="mt-2 bg-dropdown-element-bg dark:bg-dropdown-element-dark-bg rounded-md shadow-lg border border-dropdown-border dark:border-dropdown-border">
+      {onOpen && (
+        <div className="mt-2 bg-dropdown-element-bg dark:bg-dropdown-element-dark-bg rounded-md shadow-lg border border-dropdown-border dark:border-dropdown-border overflow-hidden">
           {elements.map((element, index) => (
             <div
               key={index}
@@ -125,7 +78,7 @@ const DropDown = ({
             </div>
           ))}
         </div>
-      </div>
+      )}
     </div>
   )
 }

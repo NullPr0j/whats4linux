@@ -1,4 +1,4 @@
-import { useEffect, useRef, useCallback, useState, memo } from "react"
+import { useEffect, useRef, useCallback, useState, memo, useMemo } from "react"
 import clsx from "clsx"
 import {
   GetChatList,
@@ -11,12 +11,15 @@ import {
 import { api } from "../../wailsjs/go/models"
 import { EventsOn } from "../../wailsjs/runtime/runtime"
 import { ChatDetail } from "./ChatDetail"
-import { useChatStore, useChatById, useFilteredChatIds, useArchivedCount } from "../store"
+import { useChatStore, useChatById, useFilteredChatIds, useArchivedCount, useCategoryStore, useDraftStore, type ChatCategory } from "../store"
 import { useSelfAvatarStore } from "../store/useSelfAvatarStore"
 import { useChatMuted } from "../store/useMuteStore"
 import type { ChatItem } from "../store/types"
 import { StatusList, StoryViewer, type StatusGroup } from "../components/chat/Status"
 import { CommunityList, CommunityHome, CommunitiesWelcome } from "../components/chat/Communities"
+import { CategoryBar } from "../components/chat/CategoryBar"
+import { CategoryModal } from "../components/chat/CategoryModal"
+import { AssignCategoryModal } from "../components/chat/AssignCategoryModal"
 import {
   getAvatarColor,
   AVATAR_ICON_COLOR,
@@ -33,32 +36,32 @@ import {
 } from "../assets/svgs/chat_icons"
 import { SearchIcon } from "../assets/svgs/settings_icons"
 import { GoBackIcon } from "../assets/svgs/header_icons"
-import {
-  ResizablePanelGroup,
-  ResizablePanel,
-  ResizableHandle,
-} from "../components/common/resizable"
+import { ResizablePanelGroup, ResizablePanel, ResizableHandle } from "../components/common/resizable"
 import { useContactStore } from "@/store/useContactStore"
+import { NewChatModal } from "../components/chat/NewChatModal"
+import { isMe } from "../lib/self"
 
 interface HeaderProps {
   onOpenSettings: () => void
+  onNewChat: () => void
   avatar?: string
 }
 
-const Header = ({ onOpenSettings, avatar }: HeaderProps) => (
+const Header = ({ onOpenSettings, onNewChat, avatar }: HeaderProps) => (
   <div className="h-16 bg-light-secondary dark:bg-dark-bg flex items-center justify-between px-4 border-b border-gray-200 dark:border-white/5">
     <h1 className="text-xl font-bold text-light-text dark:text-white">WhatsApp</h1>
     <div className="flex items-center gap-1 text-gray-500 dark:text-gray-400">
       <button
         title="New Chat"
-        className="hover:bg-gray-100 dark:hover:bg-white/10 p-2 rounded-full"
+        onClick={onNewChat}
+        className="hover:bg-gray-100 dark:hover:bg-white/10 p-2 rounded-full cursor-pointer transition-colors"
       >
         <NewChatIcon />
       </button>
       <button
         title="Menu"
         onClick={onOpenSettings}
-        className="hover:bg-gray-100 dark:hover:bg-white/10 p-2 rounded-full"
+        className="hover:bg-gray-100 dark:hover:bg-white/10 p-2 rounded-full cursor-pointer transition-colors"
       >
         <MenuIcon />
       </button>
@@ -236,6 +239,7 @@ const ChatListItemContent = memo(
   ({ chat, muted, isSelected, onSelect, onContextMenu }: ChatListItemContentProps) => {
     const theme = useAppSettingsStore(s => s.theme)
     const dark = theme === "dark"
+    const draft = useDraftStore(s => s.drafts[chat.id])
     const isCommunityChat = Boolean(chat.isCommunityGroup && chat.communityJid)
     const communityName = isCommunityChat ? chat.communityName || "Community" : null
 
@@ -299,13 +303,22 @@ const ChatListItemContent = memo(
           </div>
           <div className="flex items-center gap-2">
             <div className="flex-1 text-sm text-gray-500 dark:text-[#8696a0] truncate [&_p]:inline [&_p]:m-0 ">
-              {chat.sender && chat.type === "group" && (
-                <span className="mr-1">{chat.sender}: </span>
+              {draft ? (
+                <>
+                  <span className="text-[#00a884] dark:text-[#00a884] font-medium mr-1">Draft:</span>
+                  <span className="text-gray-700 dark:text-gray-300">{draft}</span>
+                </>
+              ) : (
+                <>
+                  {chat.sender && chat.type === "group" && (
+                    <span className="mr-1">{chat.sender}: </span>
+                  )}
+                  <span
+                    className="[&_br]:hidden no-formatting"
+                    dangerouslySetInnerHTML={{ __html: chat.subtitle }}
+                  />
+                </>
               )}
-              <span
-                className="[&_br]:hidden no-formatting"
-                dangerouslySetInnerHTML={{ __html: chat.subtitle }}
-              />
             </div>
             {chat.pinned && <PinIcon className="shrink-0 text-gray-400 dark:text-[#8696a0]" />}
             {chat.unreadCount ? (
@@ -425,6 +438,18 @@ export function ChatListScreen({ onOpenSettings }: ChatListScreenProps) {
   // When opening a group from a community home, remember it so Back returns there.
   const [communityReturn, setCommunityReturn] = useState<api.CommunitySummary | null>(null)
 
+  const [isCategoryModalOpen, setIsCategoryModalOpen] = useState(false)
+  const [editingCategory, setEditingCategory] = useState<ChatCategory | null>(null)
+  const [assignChat, setAssignChat] = useState<ChatItem | null>(null)
+  const [isNewChatModalOpen, setIsNewChatModalOpen] = useState(false)
+
+  const activeCategoryId = useCategoryStore(state => state.activeCategoryId)
+  const categories = useCategoryStore(state => state.categories)
+  const activeCategory = useMemo(
+    () => categories.find(c => c.id === activeCategoryId),
+    [categories, activeCategoryId],
+  )
+
   const handleChatSelect = useCallback(
     (chat: ChatItem) => {
       setSelectedCommunity(null)
@@ -434,6 +459,27 @@ export function ChatListScreen({ onOpenSettings }: ChatListScreenProps) {
     },
     [selectChat, clearUnreadCount],
   )
+
+  const handleNewChatSelect = useCallback(
+    (chat: ChatItem) => {
+      const existing = useChatStore.getState().chatsById.get(chat.id)
+      const target = existing ? { ...existing, ...chat } : chat
+      useChatStore.getState().addChat(target)
+      handleChatSelect(target)
+    },
+    [handleChatSelect],
+  )
+
+  useEffect(() => {
+    const handleGlobalShortcuts = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.altKey && e.key.toLowerCase() === "n") {
+        e.preventDefault()
+        setIsNewChatModalOpen(true)
+      }
+    }
+    window.addEventListener("keydown", handleGlobalShortcuts)
+    return () => window.removeEventListener("keydown", handleGlobalShortcuts)
+  }, [])
 
   const handleCommunitySelect = useCallback(
     (community: api.CommunitySummary) => {
@@ -477,13 +523,15 @@ export function ChatListScreen({ onOpenSettings }: ChatListScreenProps) {
       return Promise.all(
         chatElements.map(async c => {
           const isGroup = c.jid?.endsWith("@g.us") || false
-          const avatar = c.avatar_url || ""
-          const senderName = c.Sender ? await getContactName(c.Sender) : ""
+          const isSelf = isMe(c.jid)
+          const selfAvatar = useSelfAvatarStore.getState().selfAvatar
+          const avatar = (isSelf ? (c.avatar_url || selfAvatar) : c.avatar_url) || ""
+          const senderName = c.Sender ? (isMe(c.Sender) ? "You" : await getContactName(c.Sender)) : ""
 
           return {
             id: c.jid || "",
-            name: c.full_name || c.push_name || c.short || c.phno || "Unknown",
-            subtitle: c.latest_message || "",
+            name: isSelf ? "You" : (c.full_name || c.push_name || c.short || c.phno || "Unknown"),
+            subtitle: isSelf && !c.latest_message ? "Message yourself" : (c.latest_message || ""),
             type: isGroup ? "group" : "contact",
             timestamp: c.LatestTS,
             avatar: avatar,
@@ -713,7 +761,17 @@ export function ChatListScreen({ onOpenSettings }: ChatListScreenProps) {
         }
 
         // Check if we already have this chat in our list
-        const existingChat = getChat(data.chatId)
+        let existingChat = getChat(data.chatId)
+        if (!existingChat && data.chatId) {
+          const userNum = data.chatId.split("@")[0].split(":")[0]
+          const chatsMap = useChatStore.getState().chatsById
+          for (const c of chatsMap.values()) {
+            if (c.id.split("@")[0].split(":")[0] === userNum) {
+              existingChat = c
+              break
+            }
+          }
+        }
         if (existingChat) {
           let previewText = data.messageText
           let senderForUpdate = data.sender
@@ -723,7 +781,7 @@ export function ChatListScreen({ onOpenSettings }: ChatListScreenProps) {
           }
 
           // Update only this specific chat - no full re-fetch needed!
-          updateChatLastMessage(data.chatId, previewText, data.timestamp, senderForUpdate)
+          updateChatLastMessage(existingChat.id, previewText, data.timestamp, senderForUpdate)
         } else {
           // New chat we don't have - need to fetch to get avatar/name
           setTimeout(fetchChats, 500)
@@ -783,6 +841,17 @@ export function ChatListScreen({ onOpenSettings }: ChatListScreenProps) {
           >
             {chatMenu.chat.archived ? "Unarchive chat" : "Archive chat"}
           </button>
+          <div className="my-1 border-t border-gray-100 dark:border-white/5" />
+          <button
+            onClick={() => {
+              const target = chatMenu.chat
+              setChatMenu(null)
+              setAssignChat(target)
+            }}
+            className="w-full px-4 py-2 text-left text-sm text-gray-800 hover:bg-gray-100 dark:text-gray-100 dark:hover:bg-white/5"
+          >
+            Categories...
+          </button>
         </div>
       )}
       <ResizablePanelGroup className="h-full">
@@ -798,7 +867,11 @@ export function ChatListScreen({ onOpenSettings }: ChatListScreenProps) {
             selectedChatId || selectedCommunity ? "hidden md:flex" : "flex",
           )}
         >
-          <Header onOpenSettings={onOpenSettings} avatar={selfAvatar} />
+          <Header
+            onOpenSettings={onOpenSettings}
+            onNewChat={() => setIsNewChatModalOpen(true)}
+            avatar={selfAvatar}
+          />
           <div className="flex gap-2 px-3 pb-2 pt-1 overflow-x-auto">
             {(["chats", "communities", "channels", "status"] as const).map(v => (
               <button
@@ -826,6 +899,20 @@ export function ChatListScreen({ onOpenSettings }: ChatListScreenProps) {
                     ? "Search channels"
                     : "Search or start new chat"
               }
+            />
+          )}
+
+          {/* Categories Bar */}
+          {!showArchived && view === "chats" && (
+            <CategoryBar
+              onOpenCreate={() => {
+                setEditingCategory(null)
+                setIsCategoryModalOpen(true)
+              }}
+              onOpenEdit={cat => {
+                setEditingCategory(cat)
+                setIsCategoryModalOpen(true)
+              }}
             />
           )}
 
@@ -869,11 +956,36 @@ export function ChatListScreen({ onOpenSettings }: ChatListScreenProps) {
                 onSelect={handleCommunitySelect}
               />
             ) : filteredChatIds.length === 0 ? (
-              <EmptyState
-                hasChats={totalChats > 0}
-                isLoading={isFetchingRef.current}
-                onRefresh={fetchChats}
-              />
+              activeCategory && !searchTerm ? (
+                <div className="flex flex-col items-center justify-center p-8 text-center text-gray-500 dark:text-gray-400">
+                  <div className="w-12 h-12 rounded-full bg-gray-100 dark:bg-white/5 flex items-center justify-center mb-3 text-gray-400">
+                    <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+                    </svg>
+                  </div>
+                  <p className="font-medium text-gray-700 dark:text-gray-200 mb-1 text-sm">
+                    No chats in "{activeCategory.name}"
+                  </p>
+                  <p className="text-xs mb-4 max-w-56 text-gray-400">
+                    Add chats to this category to have them always show here.
+                  </p>
+                  <button
+                    onClick={() => {
+                      setEditingCategory(activeCategory)
+                      setIsCategoryModalOpen(true)
+                    }}
+                    className="px-4 py-2 bg-[#00a884] hover:bg-[#008f72] text-white rounded-xl text-xs font-medium transition-colors shadow-sm cursor-pointer"
+                  >
+                    Add Chats
+                  </button>
+                </div>
+              ) : (
+                <EmptyState
+                  hasChats={totalChats > 0}
+                  isLoading={isFetchingRef.current}
+                  onRefresh={fetchChats}
+                />
+              )
             ) : (
               filteredChatIds.map(chatId => (
                 <ChatListItem
@@ -927,6 +1039,33 @@ export function ChatListScreen({ onOpenSettings }: ChatListScreenProps) {
           )}
         </ResizablePanel>
       </ResizablePanelGroup>
+
+      <CategoryModal
+        isOpen={isCategoryModalOpen || !!editingCategory}
+        category={editingCategory}
+        onClose={() => {
+          setIsCategoryModalOpen(false)
+          setEditingCategory(null)
+        }}
+      />
+
+      <AssignCategoryModal
+        isOpen={!!assignChat}
+        chatId={assignChat?.id ?? null}
+        chatName={assignChat?.name ?? ""}
+        onClose={() => setAssignChat(null)}
+        onCreateNew={() => {
+          setAssignChat(null)
+          setEditingCategory(null)
+          setIsCategoryModalOpen(true)
+        }}
+      />
+
+      <NewChatModal
+        isOpen={isNewChatModalOpen}
+        onClose={() => setIsNewChatModalOpen(false)}
+        onSelectChat={handleNewChatSelect}
+      />
     </div>
   )
 }

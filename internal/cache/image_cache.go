@@ -103,8 +103,13 @@ func (ic *ImageCache) SaveImage(messageID string, data []byte, mime string, widt
 	path := filepath.Join(ic.imagesDir, hashStr+ext)
 
 	if _, err := os.Stat(path); os.IsNotExist(err) {
-		if err := os.WriteFile(path, data, 0644); err != nil {
+		tmpPath := fmt.Sprintf("%s.%d.tmp", path, time.Now().UnixNano())
+		if err := os.WriteFile(tmpPath, data, 0644); err != nil {
 			return "", fmt.Errorf("failed to write image file: %v", err)
+		}
+		if err := os.Rename(tmpPath, path); err != nil {
+			_ = os.Remove(tmpPath)
+			return "", fmt.Errorf("failed to rename image file: %v", err)
 		}
 	}
 
@@ -331,6 +336,20 @@ func (ic *ImageCache) GetAvatarFilePath(jid string) (string, error) {
 	return ic.GetImageFilePath(avatarKey)
 }
 
+// GetAvatarAbsolutePath returns the absolute on-disk path for a cached avatar by JID, or "" if not found.
+func (ic *ImageCache) GetAvatarAbsolutePath(jid string) string {
+	avatarKey := "avatar_" + jid
+	meta, err := ic.GetImageByMessageID(avatarKey)
+	if err != nil || meta == nil {
+		return ""
+	}
+	fullPath := filepath.Join(ic.imagesDir, meta.SHA256+mimeToExt(meta.Mime))
+	if _, err := os.Stat(fullPath); err == nil {
+		return fullPath
+	}
+	return ""
+}
+
 // ReadAvatarByJID reads an avatar image by JID
 func (ic *ImageCache) ReadAvatarByJID(jid string) ([]byte, string, error) {
 	avatarKey := "avatar_" + jid
@@ -349,13 +368,29 @@ func (ic *ImageCache) Close() error {
 }
 
 func mimeToExt(mime string) string {
-	switch mime {
-	case "image/png":
+	switch {
+	case mime == "image/png":
 		return ".png"
-	case "image/gif":
+	case mime == "image/gif":
 		return ".gif"
-	case "image/webp":
+	case mime == "image/webp":
 		return ".webp"
+	case strings.HasPrefix(mime, "audio/ogg"):
+		return ".ogg"
+	case strings.HasPrefix(mime, "audio/mp4"), strings.HasPrefix(mime, "audio/m4a"), strings.HasPrefix(mime, "audio/aac"):
+		return ".m4a"
+	case strings.HasPrefix(mime, "audio/mpeg"), strings.HasPrefix(mime, "audio/mp3"):
+		return ".mp3"
+	case strings.HasPrefix(mime, "audio/wav"):
+		return ".wav"
+	case strings.HasPrefix(mime, "video/mp4"):
+		return ".mp4"
+	case strings.HasPrefix(mime, "video/webm"):
+		return ".webm"
+	case strings.HasPrefix(mime, "audio/"):
+		return ".ogg"
+	case strings.HasPrefix(mime, "video/"):
+		return ".mp4"
 	default:
 		return ".jpg"
 	}
