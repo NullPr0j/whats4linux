@@ -5,9 +5,9 @@ import (
 
 	"github.com/lugvitc/whats4linux/internal/settings"
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/polymorfa/hypermeow"
-	"github.com/polymorfa/hypermeow/store/sqlstore"
-	waLog "github.com/polymorfa/hypermeow/util/log"
+	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/store/sqlstore"
+	waLog "go.mau.fi/whatsmeow/util/log"
 )
 
 func NewClient(ctx context.Context, container *sqlstore.Container) *whatsmeow.Client {

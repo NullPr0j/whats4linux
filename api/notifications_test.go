@@ -3,7 +3,7 @@ package api
 import (
 	"testing"
 
-	"github.com/polymorfa/hypermeow/types"
+	"go.mau.fi/whatsmeow/types"
 )
 
 func TestSetActiveChatAndIsSameChat(t *testing.T) {

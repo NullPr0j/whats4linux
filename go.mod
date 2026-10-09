@@ -7,9 +7,11 @@ require (
 	github.com/gen2brain/malgo v0.11.26
 	github.com/mattn/go-sqlite3 v1.14.48
 	github.com/nyaruka/phonenumbers v1.8.0
-	github.com/polymorfa/hypermeow v0.0.0-20260906031440-90f9e4ec2c88
-	github.com/purpshell/meowcaller v0.0.0-20260906234207-c48c3e2a243c
-	github.com/wailsapp/wails/v2 v2.13.0
+	github.com/purpshell/meowcaller v0.0.0
+	github.com/wailsapp/wails/v2 v2.16.0
+	go.mau.fi/util v0.9.12-0.20260717235539-f9ffa7eca58d
+	go.mau.fi/whatsmeow v0.0.0-20260722203353-e9a033b24933
+	golang.org/x/image v0.41.0
 	google.golang.org/protobuf v1.36.11
 )
 
@@ -17,8 +19,10 @@ require (
 	filippo.io/edwards25519 v1.2.0 // indirect
 	git.sr.ht/~jackmordaunt/go-toast v1.1.2 // indirect
 	git.sr.ht/~jackmordaunt/go-toast/v2 v2.0.3 // indirect
+	github.com/beeper/argo-go v1.1.2 // indirect
 	github.com/bep/debounce v1.2.1 // indirect
 	github.com/coder/websocket v1.8.15 // indirect
+	github.com/elliotchance/orderedmap/v3 v3.1.0 // indirect
 	github.com/esiqveland/notify v0.13.3 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
 	github.com/godbus/dbus/v5 v5.2.2 // indirect
@@ -34,7 +38,7 @@ require (
 	github.com/leaanthony/slicer v1.6.0 // indirect
 	github.com/leaanthony/u v1.1.1 // indirect
 	github.com/mattn/go-colorable v0.1.15 // indirect
-	github.com/mattn/go-isatty v0.0.22 // indirect
+	github.com/mattn/go-isatty v0.0.24 // indirect
 	github.com/nfnt/resize v0.0.0-20180221191011-83c6a9932646 // indirect
 	github.com/petermattis/goid v0.0.0-20260713124913-97594f28f5ca // indirect
 	github.com/pion/datachannel v1.6.0 // indirect
@@ -46,7 +50,6 @@ require (
 	github.com/pion/transport/v4 v4.0.1 // indirect
 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c // indirect
 	github.com/pkg/errors v0.9.1 // indirect
-	github.com/polymorfa/libsignal-protocol-go v0.2.3-0.20260806162910-a2adef2e8a11 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/rs/zerolog v1.35.1 // indirect
 	github.com/samber/lo v1.53.0 // indirect
@@ -56,13 +59,19 @@ require (
 	github.com/tkrajina/go-reflector v0.5.8 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
 	github.com/valyala/fasttemplate v1.2.2 // indirect
+	github.com/vektah/gqlparser/v2 v2.5.35 // indirect
 	github.com/wailsapp/go-webview2 v1.0.23 // indirect
 	github.com/wailsapp/mimetype v1.4.1 // indirect
-	go.mau.fi/util v0.9.12-0.20260717235539-f9ffa7eca58d // indirect
-	golang.org/x/crypto v0.54.0 // indirect
+	go.mau.fi/libsignal v0.2.2 // indirect
+	golang.org/x/crypto v0.57.0 // indirect
 	golang.org/x/exp v0.0.0-20260709172345-9ea1abe57597 // indirect
-	golang.org/x/net v0.57.0 // indirect
-	golang.org/x/sync v0.22.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
-	golang.org/x/text v0.40.0 // indirect
+	golang.org/x/net v0.59.0 // indirect
+	golang.org/x/sync v0.23.0 // indirect
+	golang.org/x/sys v0.48.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
 )
+
+// replace github.com/wailsapp/wails/v2 v2.11.0 => /home/celestix/go/pkg/mod
+
+// Pin the last meowcaller commit that still uses stock whatsmeow (27a3c6b).
+replace github.com/purpshell/meowcaller v0.0.0 => github.com/purpshell/meowcaller v0.0.0-20260811012811-27a3c6b18657

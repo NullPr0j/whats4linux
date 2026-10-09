@@ -6,7 +6,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/polymorfa/hypermeow/types"
+	"go.mau.fi/whatsmeow/types"
 )
 
 // CommunitySummary is a community entry for the communities list.

@@ -62,3 +62,19 @@ export const applyThemeColors = (colors = THEME) => {
     })
   })
 }
+
+export const DEFAULT_EASES = {
+  DropDown: {
+    open: "power2.out",
+    close: "power2.in",
+    rotate: "power2.out",
+  },
+  ToggleButton: {
+    slide: "elastic.out(1, 0.5)",
+  },
+  CallOverlay: {
+    open: "power2.out",
+    close: "power2.in",
+  },
+} as const
+

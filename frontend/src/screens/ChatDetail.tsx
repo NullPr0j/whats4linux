@@ -7,12 +7,14 @@ import {
   GetGroupInfo,
   GetProfile,
   MarkRead,
+  PlaceCall,
   EditMessage,
   DeleteMessage,
 } from "../../wailsjs/go/api/Api"
+import { preloadImages, visibleImageIDs } from "../components/chat/MediaContent"
 import { store } from "../../wailsjs/go/models"
 import { EventsOn } from "../../wailsjs/runtime/runtime"
-import { useMessageStore, useUIStore, useChatStore, useCallStore, useDraftStore } from "../store"
+import { useMessageStore, useUIStore, useChatStore, useDraftStore } from "../store"
 import { useAppSettingsStore } from "../store/useAppSettingsStore"
 import { MessageList, type MessageListHandle } from "../components/chat/MessageList"
 import { ChatHeader } from "../components/chat/ChatHeader"
@@ -20,6 +22,7 @@ import { ChatInput } from "../components/chat/ChatInput"
 import { ChatInfo } from "../components/chat/ChatInfo"
 import { PdfPreviewPane } from "../components/chat/PdfPreviewPane"
 import { DeleteMessageModal } from "../components/chat/DeleteMessageModal"
+import { PollVotesSidebar } from "../components/chat/PollVotesSidebar"
 import clsx from "clsx"
 import { formatPhone, isMessageEditable } from "../lib/utils"
 import { useSelfAvatarStore } from "../store/useSelfAvatarStore"
@@ -65,9 +68,10 @@ export function ChatDetail({ chatId, chatName, chatAvatar, onBack }: ChatDetailP
     setChatInfoOpen,
     activePdf,
     closePdf,
+    pollResultsFor,
+    setPollResultsFor,
   } = useUIStore()
   const { chatsById } = useChatStore()
-  const startCall = useCallStore(s => s.startCall)
   const isGroup = chatId.endsWith("@g.us")
 
   const chatMessages = messages[chatId] || []
@@ -250,6 +254,10 @@ export function ChatDetail({ chatId, chatName, chatAvatar, onBack }: ChatDetailP
         setChatInfoOpen(false)
         return
       }
+      if (pollResultsFor) {
+        setPollResultsFor(null)
+        return
+      }
       if (showEmojiPicker) {
         setShowEmojiPicker(false)
         return
@@ -270,7 +278,24 @@ export function ChatDetail({ chatId, chatName, chatAvatar, onBack }: ChatDetailP
     }
     window.addEventListener("keydown", onKey)
     return () => window.removeEventListener("keydown", onKey)
-  }, [activePdf, closePdf, deleteTargetMessage, chatInfoOpen, showEmojiPicker, editingMessage, handleCancelEdit, replyingTo, onBack, setChatInfoOpen, setShowEmojiPicker])
+  }, [
+    activePdf,
+    closePdf,
+    deleteTargetMessage,
+    chatInfoOpen,
+    showEmojiPicker,
+    editingMessage,
+    handleCancelEdit,
+    replyingTo,
+    onBack,
+    setChatInfoOpen,
+    setShowEmojiPicker,
+    pollResultsFor,
+    setPollResultsFor,
+  ])
+
+  const activePoll =
+    (pollResultsFor && chatMessages.find(m => m.Info?.ID === pollResultsFor)?.poll) || null
 
   const loadInitialMessages = useCallback(
     async (generation: number) => {
@@ -305,6 +330,7 @@ export function ChatDetail({ chatId, chatName, chatAvatar, onBack }: ChatDetailP
           }
         }
         setMessages(chatId, merged)
+        preloadImages(visibleImageIDs(merged))
         const more = loadedMsgs.length >= PAGE_SIZE
         hasMoreRef.current = more
         setHasMore(more)
@@ -597,7 +623,14 @@ export function ChatDetail({ chatId, chatName, chatAvatar, onBack }: ChatDetailP
         },
       }
     } else if (fileToSend) {
-      if (fileTypeToSend === "image") {
+      if (fileTypeToSend === "sticker") {
+        pendingMessage.Content = {
+          stickerMessage: {
+            mimetype: fileToSend.type,
+            _tempFile: fileToSend,
+          },
+        }
+      } else if (fileTypeToSend === "image") {
         pendingMessage.Content = {
           imageMessage: {
             caption: textToSend || "",
@@ -659,6 +692,8 @@ export function ChatDetail({ chatId, chatName, chatAvatar, onBack }: ChatDetailP
         pendingMessage.Content.audioMessage.contextInfo = contextInfo
       } else if (pendingMessage.Content.documentMessage) {
         pendingMessage.Content.documentMessage.contextInfo = contextInfo
+      } else if (pendingMessage.Content.stickerMessage) {
+        pendingMessage.Content.stickerMessage.contextInfo = contextInfo
       }
     }
 
@@ -914,7 +949,12 @@ export function ChatDetail({ chatId, chatName, chatAvatar, onBack }: ChatDetailP
             const pendingMessages = currentMessages.filter((m: any) => m.isPending)
             const pending = pendingMessages.find((m: any) => m.tempId === data.clientTempId)
             if (pending) {
-              for (const body of ["imageMessage", "videoMessage", "audioMessage"]) {
+              for (const body of [
+                "imageMessage",
+                "videoMessage",
+                "audioMessage",
+                "stickerMessage",
+              ]) {
                 const transient =
                   pending.Content?.[body]?._tempImage || pending.Content?.[body]?._tempFile
                 if (transient && data.message.Content?.[body]) {
@@ -985,7 +1025,11 @@ export function ChatDetail({ chatId, chatName, chatAvatar, onBack }: ChatDetailP
           chatAvatar={effectiveChatAvatar}
           onBack={onBack}
           onInfoClick={() => setChatInfoOpen(!chatInfoOpen)}
-          onCallClick={!isGroup && !isSelf ? () => startCall(chatId, effectiveChatName) : undefined}
+          onCallClick={
+            chatType === "contact"
+              ? () => PlaceCall(chatId).catch(err => console.error("place call failed:", err))
+              : undefined
+          }
         />
 
         {/* Pinned-messages banner: shows the latest pin, click cycles through
@@ -1179,6 +1223,7 @@ export function ChatDetail({ chatId, chatName, chatAvatar, onBack }: ChatDetailP
             setSelectedFile(null)
             setPastedImage(null)
           }}
+          onFileTypeChange={setSelectedFileType}
           onEmojiClick={emoji => {
             setInputText(prev => {
               const next = prev + emoji
@@ -1218,6 +1263,14 @@ export function ChatDetail({ chatId, chatName, chatAvatar, onBack }: ChatDetailP
         onClose={() => setDeleteTargetMessage(null)}
         onDeleteForEveryone={() => handleConfirmDelete(true)}
         onDeleteForMe={() => handleConfirmDelete(false)}
+      />
+
+      <PollVotesSidebar
+        poll={activePoll}
+        isOpen={!!pollResultsFor}
+        onClose={() => setPollResultsFor(null)}
+        chatId={chatId}
+        chatType={chatType}
       />
     </div>
   )

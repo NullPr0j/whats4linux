@@ -2,8 +2,8 @@ package wa
 
 import (
 	"github.com/lugvitc/whats4linux/internal/types"
-	"github.com/polymorfa/hypermeow"
-	"github.com/polymorfa/hypermeow/proto/waE2E"
+	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/proto/waE2E"
 )
 
 type MediaContent interface {
@@ -24,9 +24,9 @@ type Media struct {
 	fileEncSHA256 []byte
 	url           string
 	mimetype      string
+	fileName      string
 	mediaType     types.MediaType
 	width, height int
-	fileName      string
 }
 
 func NewMedia(
@@ -44,10 +44,10 @@ func NewMedia(
 		fileEncSHA256: fileEncSHA256,
 		url:           url,
 		mimetype:      mimetype,
+		fileName:      fileName,
 		width:         width,
 		height:        height,
 		mediaType:     mediaType,
-		fileName:      fileName,
 	}
 }
 

@@ -9,7 +9,7 @@ import (
 	"github.com/lugvitc/whats4linux/internal/query"
 	"github.com/lugvitc/whats4linux/internal/wa"
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/polymorfa/hypermeow"
+	"go.mau.fi/whatsmeow"
 )
 
 func TestGetCommunityListReturnsPopulatedCache(t *testing.T) {

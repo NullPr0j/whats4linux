@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react"
-import { Login, GetCustomCSS, GetCustomJS, SetWindowFocused } from "../wailsjs/go/api/Api"
+import { Login, GetCustomCSS, GetCustomJS, SetWindowFocused, PlaceCall } from "../wailsjs/go/api/Api"
 import { EventsOn, BrowserOpenURL } from "../wailsjs/runtime/runtime"
 import QRCode from "qrcode"
 import { ChatListScreen } from "./screens/ChatScreen"
@@ -8,11 +8,9 @@ import { SettingsScreen } from "./screens/SettingsScreen"
 import { initSelf } from "./lib/self"
 import { Lightbox } from "./components/Lightbox"
 import { ForwardModal } from "./components/chat/ForwardModal"
-import { IncomingCallModal } from "./components/chat/IncomingCallModal"
-import { ActiveCallBar } from "./components/chat/ActiveCallBar"
 import { ContactProfileModal } from "./components/chat/ContactProfileModal"
 
-import { useUIStore, useCallStore, useChatStore } from "./store"
+import { useUIStore, useChatStore } from "./store"
 import { useAppSettingsStore } from "./store/useAppSettingsStore"
 import { applyThemeClass } from "./lib/theme"
 import { useMuteStore } from "./store/useMuteStore"
@@ -30,7 +28,6 @@ function App() {
   const profileModalJid = useUIStore(s => s.profileModalJid)
   const closeProfileModal = useUIStore(s => s.closeProfileModal)
   const selectChat = useChatStore(s => s.selectChat)
-  const startCall = useCallStore(s => s.startCall)
 
   useEffect(() => {
     useAppSettingsStore.getState().loadSettings()
@@ -145,14 +142,11 @@ function App() {
       void Login().catch(err => setStatus(`error: ${String(err)}`))
     }
 
-    const unsubCalls = useCallStore.getState().initEventListeners()
-
     return () => {
       unsubQR()
       unsubStatus()
       unsubDownload()
       unsubMuteUpdate()
-      unsubCalls()
     }
   }, [])
 
@@ -160,8 +154,6 @@ function App() {
     <div className="min-h-screen bg-light-secondary text-light-text dark:bg-black dark:text-white relative">
       <Lightbox />
       <ForwardModal />
-      <IncomingCallModal />
-      <ActiveCallBar />
       <ContactProfileModal
         jid={profileModalJid || ""}
         isOpen={!!profileModalJid}
@@ -174,8 +166,8 @@ function App() {
           })
           closeProfileModal()
         }}
-        onStartCall={(jid, name) => {
-          startCall(jid.split(":")[0], name)
+        onStartCall={jid => {
+          PlaceCall(jid.split(":")[0]).catch(console.error)
           closeProfileModal()
         }}
       />

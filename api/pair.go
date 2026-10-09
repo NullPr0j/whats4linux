@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/nyaruka/phonenumbers"
-	"github.com/polymorfa/hypermeow"
+	"go.mau.fi/whatsmeow"
 )
 
 // SanitizePhoneNumber parses and validates an international phone number.

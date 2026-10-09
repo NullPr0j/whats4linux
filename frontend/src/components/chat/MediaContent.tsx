@@ -1,9 +1,14 @@
-import { useState, useEffect, useRef } from "react"
+import { useState, useEffect, useRef, useCallback } from "react"
 import { store } from "../../../wailsjs/go/models"
-import { GetCachedImage, GetCachedMedia, DownloadMedia, GetVideoThumbnail } from "../../../wailsjs/go/api/Api"
+import {
+  GetCachedImage,
+  GetCachedImages,
+  DownloadMedia,
+  GetVideoThumbnail,
+  GetImageThumbnail,
+} from "../../../wailsjs/go/api/Api"
 import { useUIStore } from "../../store"
 import { LRUCache } from "../../lib/lruCache"
-import { VoiceNotePlayer } from "./VoiceNotePlayer"
 
 // TODO: fix word wrap for longer words in content
 
@@ -20,9 +25,12 @@ const MEDIA_MAX_H = 400
 // Data URLs can be large. Keep enough recently viewed media to avoid flicker
 // when Virtuoso remounts nearby rows without retaining every chat image for the
 // lifetime of the process.
-const imagePathCache = new LRUCache<string, string>(128, 64 * 1024 * 1024, value => value.length)
+const imagePathCache = new LRUCache<string, string>(48, 32 * 1024 * 1024, value => value.length)
 const videoThumbCache = new LRUCache<string, string>(100, 16 * 1024 * 1024, value => value.length)
+const imageThumbCache = new LRUCache<string, string>(100, 8 * 1024 * 1024, value => value.length)
 const mediaRequests = new Map<string, Promise<string>>()
+const THUMB_MISS = "__miss__"
+const PRELOAD_BATCH_LIMIT = 8
 
 function loadMediaOnce(key: string, loader: () => Promise<string>): Promise<string> {
   const existing = mediaRequests.get(key)
@@ -32,6 +40,88 @@ function loadMediaOnce(key: string, loader: () => Promise<string>): Promise<stri
   })
   mediaRequests.set(key, request)
   return request
+}
+
+const pendingPreload = new Set<string>()
+const preloadWaiters = new Map<string, { promise: Promise<void>; resolve: () => void }>()
+let preloadInFlight = false
+
+function waiterFor(id: string): Promise<void> {
+  const existing = preloadWaiters.get(id)
+  if (existing) return existing.promise
+  let resolve = () => {}
+  const promise = new Promise<void>(r => {
+    resolve = r
+  })
+  preloadWaiters.set(id, { promise, resolve })
+  return promise
+}
+
+function resolveWaiter(id: string) {
+  const waiter = preloadWaiters.get(id)
+  if (!waiter) return
+  waiter.resolve()
+  preloadWaiters.delete(id)
+}
+
+type PreloadMessage = {
+  Info?: { ID?: string }
+  Content?: { imageMessage?: unknown; stickerMessage?: unknown }
+}
+
+export function imageMediaIDs(messages: PreloadMessage[]): string[] {
+  const ids: string[] = []
+  for (const message of messages) {
+    if (!message.Content?.imageMessage && !message.Content?.stickerMessage) continue
+    const id = message.Info?.ID
+    if (id && !id.startsWith("temp-")) ids.push(id)
+  }
+  return ids
+}
+
+export function visibleImageIDs(messages: PreloadMessage[], limit = PRELOAD_BATCH_LIMIT): string[] {
+  const ids = imageMediaIDs(messages)
+  return ids.length <= limit ? ids : ids.slice(-limit)
+}
+
+export function preloadImages(ids: string[]) {
+  if (ids.length === 0) return
+  for (const id of ids) {
+    if (!id || imagePathCache.has(id)) continue
+    pendingPreload.add(id)
+    waiterFor(id)
+  }
+  pumpPreload()
+}
+
+function pumpPreload() {
+  if (preloadInFlight) return
+  const batch: string[] = []
+  for (const id of pendingPreload) {
+    if (imagePathCache.has(id)) {
+      pendingPreload.delete(id)
+      resolveWaiter(id)
+      continue
+    }
+    batch.push(id)
+    pendingPreload.delete(id)
+    if (batch.length >= PRELOAD_BATCH_LIMIT) break
+  }
+  if (batch.length === 0) return
+
+  preloadInFlight = true
+  void GetCachedImages(batch)
+    .then(map => {
+      for (const [id, dataUrl] of Object.entries(map)) {
+        if (dataUrl) imagePathCache.set(id, dataUrl)
+      }
+    })
+    .catch(() => {})
+    .finally(() => {
+      for (const id of batch) resolveWaiter(id)
+      preloadInFlight = false
+      pumpPreload()
+    })
 }
 
 // Fallback box for GIF videos whose dimensions were never stored (rows synced
@@ -89,11 +179,16 @@ export function MediaContent({
   const [thumbnailSrc, setThumbnailSrc] = useState<string | null>(
     () => videoThumbCache.get(message.Info.ID) ?? null,
   )
+  const [imageThumbnailSrc, setImageThumbnailSrc] = useState<string | null>(() => {
+    const cached = imageThumbCache.get(message.Info.ID)
+    return cached && cached !== THUMB_MISS ? cached : null
+  })
   const loadingRef = useRef(false)
   const mountedRef = useRef(true)
   const gifLoopsRef = useRef(0)
   const placeholderRef = useRef<HTMLDivElement | null>(null)
   const openLightbox = useUIStore(s => s.openLightbox)
+  const handleDownloadRef = useRef<(() => Promise<string | null>) | null>(null)
 
   // Reserve the final layout box before the media loads. Only images and GIF
   // videos swap a placeholder for an inline element, so only they can shift.
@@ -104,28 +199,54 @@ export function MediaContent({
         (type === "image" ? IMAGE_FALLBACK_BOX : GIF_FALLBACK_BOX))
       : null
 
-  const handleDownload = async () => {
-    if (loadingRef.current) return
+  const handleDownload = useCallback(async (): Promise<string | null> => {
+    if (type === "image" || type === "sticker") {
+      const cached = imagePathCache.get(message.Info.ID)
+      if (cached) {
+        if (mountedRef.current) setMediaSrc(cached)
+        return cached
+      }
+      const pending = preloadWaiters.get(message.Info.ID)?.promise
+      if (pending) await pending
+      const afterBatch = imagePathCache.get(message.Info.ID)
+      if (afterBatch) {
+        if (mountedRef.current) setMediaSrc(afterBatch)
+        return afterBatch
+      }
+    }
+    if (loadingRef.current) return null
     loadingRef.current = true
     setLoading(true)
     try {
-      const dataUrl =
-        type === "image" || type === "sticker"
-          ? await loadMediaOnce(`image:${message.Info.ID}`, () => GetCachedImage(message.Info.ID))
-          : await loadMediaOnce(`media:${chatId}:${message.Info.ID}`, () =>
-              DownloadMedia(chatId, message.Info.ID),
-            )
-      if (dataUrl) {
-        imagePathCache.set(message.Info.ID, dataUrl)
-        if (mountedRef.current) setMediaSrc(dataUrl)
+      let dataUrl: string
+      if (type === "image" || type === "sticker") {
+        dataUrl = await loadMediaOnce(`image:${message.Info.ID}`, () =>
+          GetCachedImage(message.Info.ID),
+        )
+      } else {
+        dataUrl = await loadMediaOnce(`media:${chatId}:${message.Info.ID}`, () =>
+          DownloadMedia(chatId, message.Info.ID),
+        )
       }
-    } catch (err) {
-      console.error(`Failed to download ${type} ${message.Info.ID}:`, err)
+      if (dataUrl) {
+        if (type === "image" || type === "sticker" || isGif) {
+          imagePathCache.set(message.Info.ID, dataUrl)
+        }
+        if (mountedRef.current) setMediaSrc(dataUrl)
+        return dataUrl
+      }
+      return null
+    } catch {
+      return null
     } finally {
       loadingRef.current = false
       if (mountedRef.current) setLoading(false)
     }
-  }
+  }, [type, chatId, isGif, message.Info.ID])
+
+  useEffect(() => {
+    handleDownloadRef.current = handleDownload
+  }, [handleDownload])
 
   // Regular videos play full-screen in the lightbox (keeps the chat thumbnail).
   // The downloaded data URL is cached in a ref so reopening doesn't re-download.
@@ -177,37 +298,48 @@ export function MediaContent({
     }
   }, [message.Content, message.Info.ID, sentMediaCache, type])
 
-  // Check if media is already cached in disk storage so already-downloaded
-  // voice messages, images, and videos load immediately without showing a download button.
+  // Auto-download image/sticker media once it's visible on screen — covers both
+  // "already visible when the chat opens" and "scrolled into view". Debounced so
+  // rows blazed past during a fast scroll don't fetch. Thumbnails share the same
+  // observer so off-screen rows don't hit SQLite on every remount.
   useEffect(() => {
-    if (mediaSrc) return
-    let cancelled = false
-    GetCachedMedia(message.Info.ID)
-      .then(url => {
-        if (!cancelled && url) {
-          imagePathCache.set(message.Info.ID, url)
-          if (mountedRef.current) setMediaSrc(url)
-        }
-      })
-      .catch(() => {})
-    return () => {
-      cancelled = true
-    }
-  }, [message.Info.ID, mediaSrc])
-
-  // Auto-download all media (images, stickers, voice notes, audio, documents) except regular videos.
-  // Videos show an instant preview frame and download on click.
-  useEffect(() => {
-    const isVideo = type === "video" && !isGif
-    const autoLoads = !isVideo
-    if (mediaSrc || !autoLoads) return
+    const autoLoads = type === "image" || type === "sticker" || (type === "video" && isGif)
+    const id = message.Info.ID
+    const wantsThumb =
+      type === "image" &&
+      !mediaSrc &&
+      !imageThumbnailSrc &&
+      !id.startsWith("temp-") &&
+      !imageThumbCache.has(id)
+    if (mediaSrc || (!autoLoads && !wantsThumb)) return
     const el = placeholderRef.current
     if (!el) return
     let timer: ReturnType<typeof setTimeout> | undefined
     const obs = new IntersectionObserver(
       ([entry]) => {
         if (entry.isIntersecting) {
-          timer = setTimeout(() => void handleDownload(), 200)
+          timer = setTimeout(() => {
+            if (
+              type === "image" &&
+              !id.startsWith("temp-") &&
+              !imageThumbCache.has(id) &&
+              !imagePathCache.has(id)
+            ) {
+              void loadMediaOnce(`thumb:${id}`, async () => {
+                try {
+                  const url = await GetImageThumbnail(id)
+                  imageThumbCache.set(id, url || THUMB_MISS)
+                  return url || THUMB_MISS
+                } catch {
+                  imageThumbCache.set(id, THUMB_MISS)
+                  return THUMB_MISS
+                }
+              }).then(url => {
+                if (url && url !== THUMB_MISS && mountedRef.current) setImageThumbnailSrc(url)
+              })
+            }
+            if (autoLoads) void handleDownloadRef.current?.()
+          }, 200)
         } else if (timer) {
           clearTimeout(timer)
           timer = undefined
@@ -220,15 +352,12 @@ export function MediaContent({
       obs.disconnect()
       if (timer) clearTimeout(timer)
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mediaSrc, type, isGif, message.Info.ID])
+  }, [mediaSrc, type, isGif, message.Info.ID, imageThumbnailSrc])
 
-  // Fetch the embedded preview for regular videos and images so the list shows
-  // an instant thumbnail while full-resolution media loads.
+  // Fetch the embedded preview for regular videos so the list shows a thumbnail
+  // + play button without downloading the whole video. (GIFs auto-play instead.)
   useEffect(() => {
-    if (mediaSrc || thumbnailSrc) return
-    const needsThumb = type === "video" || type === "image"
-    if (!needsThumb || (type === "video" && isGif)) return
+    if (type !== "video" || isGif || mediaSrc || thumbnailSrc) return
     let cancelled = false
     GetVideoThumbnail(message.Info.ID)
       .then(url => {
@@ -251,46 +380,30 @@ export function MediaContent({
     }
   }, [mediaSrc])
 
-  const displaySrc = type === "image" ? (mediaSrc || thumbnailSrc) : mediaSrc
-
-  if (displaySrc) {
+  if (mediaSrc) {
     if (type === "image" || type === "sticker") {
       return (
         <div
-          ref={!mediaSrc ? placeholderRef : undefined}
           className="relative inline-block"
-          onMouseEnter={() => type === "image" && setShowDownloadButton(true)}
+          onMouseEnter={() => setShowDownloadButton(true)}
           onMouseLeave={() => setShowDownloadButton(false)}
         >
           <img
-            src={displaySrc}
+            src={mediaSrc}
             className={
               type === "image"
-                ? `block min-w-75 max-w-82.5 max-h-100 object-cover rounded-lg cursor-pointer ${
-                    !mediaSrc && loading ? "filter blur-[1px] brightness-90" : ""
-                  }`
-                : "object-contain w-48.75 h-48.75"
+                ? "block min-w-75 max-w-82.5 max-h-100 object-cover rounded-lg cursor-pointer"
+                : "object-contain w-48.75 h-48.75 cursor-pointer"
             }
             // Same explicit box as the placeholder -> zero layout shift.
             style={type === "image" ? (reservedBox ?? undefined) : undefined}
             decoding="async"
             alt="media"
-            onClick={
-              type === "image"
-                ? () => {
-                    onImageClick?.(displaySrc)
-                    openLightbox(displaySrc)
-                  }
-                : undefined
-            }
+            onClick={() => {
+              onImageClick?.(mediaSrc)
+              openLightbox(mediaSrc)
+            }}
           />
-          {type === "image" && loading && !mediaSrc && (
-            <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-              <div className="bg-black/50 p-2 rounded-full">
-                <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-white" />
-              </div>
-            </div>
-          )}
           {type === "image" && showDownloadButton && onDownload && (
             <button
               onClick={e => {
@@ -334,83 +447,76 @@ export function MediaContent({
           style={reservedBox ?? GIF_FALLBACK_BOX}
         />
       ) : (
-        <div className="relative group/video inline-block rounded-lg overflow-hidden bg-black max-w-82.5">
-          <video
-            src={mediaSrc}
-            controls
-            playsInline
-            className="block max-w-82.5 max-h-100 rounded-lg object-contain bg-black"
-          />
+        <video src={mediaSrc} controls className="block w-64 h-64 rounded-lg object-cover" />
+      )
+    if (type === "audio") return <audio src={mediaSrc} controls className="w-75 h-14" />
+  }
+
+  if (type === "image" && imageThumbnailSrc) {
+    return (
+      <div
+        ref={placeholderRef}
+        className="relative w-64 h-64 bg-gray-200 dark:bg-gray-800 rounded-lg flex items-center justify-center overflow-hidden"
+        style={reservedBox ?? IMAGE_FALLBACK_BOX}
+        onMouseEnter={() => setShowDownloadButton(true)}
+        onMouseLeave={() => setShowDownloadButton(false)}
+      >
+        <img
+          src={imageThumbnailSrc}
+          className="w-full h-full object-cover rounded-lg"
+          decoding="async"
+          alt="media"
+          onClick={() => void handleDownload()}
+        />
+        {loading && (
+          <div className="absolute inset-0 bg-black/40 flex items-center justify-center rounded-lg">
+            <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-white" />
+          </div>
+        )}
+        {showDownloadButton && onDownload && !loading && (
           <button
             onClick={e => {
               e.stopPropagation()
-              openLightbox(mediaSrc, "video")
+              void handleDownload().then(url => {
+                if (url) onDownload()
+              })
             }}
-            title="Open video in fullscreen preview"
-            className="absolute top-2 right-2 p-2 bg-black/70 hover:bg-black/90 rounded-full text-white transition-opacity opacity-0 group-hover/video:opacity-100 focus:opacity-100 shadow-md z-10 cursor-pointer"
+            className="absolute top-2 right-2 p-2 bg-black/70 hover:bg-black/90 rounded-full text-white transition-colors"
+            title="Download image"
           >
-            <svg
-              viewBox="0 0 24 24"
-              width="18"
-              height="18"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2.5"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7" />
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+              <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z" />
             </svg>
           </button>
-        </div>
-      )
-    if (type === "audio") {
-      return (
-        <VoiceNotePlayer
-          src={mediaSrc}
-          messageId={message.Info.ID}
-          isFromMe={message.Info.IsFromMe}
-        />
-      )
-    }
+        )}
+      </div>
+    )
   }
 
-  // Video placeholder: show the embedded thumbnail preview frame with an authentic Play overlay,
-  // and only download/open the full video file on click.
+  // Video placeholder: show the embedded thumbnail (if any) with a play button
+  // so it's clearly a video, and only download the full file on click.
   if (type === "video") {
     return (
       <div
         ref={placeholderRef}
         onClick={openVideo}
-        className="relative min-w-64 max-w-82.5 rounded-lg overflow-hidden bg-gray-300 dark:bg-gray-800 flex items-center justify-center cursor-pointer bg-cover bg-center group transition-shadow hover:shadow-md select-none"
+        className="relative w-64 h-64 rounded-lg overflow-hidden bg-gray-300 dark:bg-gray-800 flex items-center justify-center cursor-pointer bg-cover bg-center"
+        // GIFs auto-swap this placeholder for the inline <video>, so it must
+        // already occupy the video's final box when dimensions are known.
         style={{
-          ...(reservedBox ?? (isGif ? GIF_FALLBACK_BOX : { width: 280, height: 200 })),
+          ...(isGif ? (reservedBox ?? GIF_FALLBACK_BOX) : null),
           ...(thumbnailSrc ? { backgroundImage: `url(${thumbnailSrc})` } : null),
         }}
-        title="Click to play video"
       >
-        {/* Subtle dark overlay over preview for clear contrast */}
-        <div className="absolute inset-0 bg-black/20 group-hover:bg-black/35 transition-colors" />
-
         {loading ? (
-          <div className="z-10 bg-black/60 p-3 rounded-full flex items-center justify-center">
-            <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-white" />
-          </div>
+          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-white" />
         ) : (
-          <div className="z-10 bg-black/60 group-hover:bg-black/75 rounded-full p-3.5 shadow-lg transition-transform group-hover:scale-110 active:scale-95">
-            <svg viewBox="0 0 24 24" width="28" height="28" fill="white" className="ml-0.5">
+          <div className="bg-black/55 rounded-full p-3">
+            <svg viewBox="0 0 24 24" width="28" height="28" fill="white">
               <path d="M8 5v14l11-7z" />
             </svg>
           </div>
         )}
-
-        {/* Video badge in bottom-left corner */}
-        <div className="absolute bottom-2 left-2 z-10 flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-black/60 text-white text-[11px] font-medium backdrop-blur-xs">
-          <svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor">
-            <path d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z" />
-          </svg>
-          <span>Video</span>
-        </div>
       </div>
     )
   }
@@ -419,15 +525,20 @@ export function MediaContent({
     return (
       <div
         ref={placeholderRef}
-        className="w-75 h-16 rounded-lg bg-gray-200 dark:bg-gray-800 flex items-center px-3 gap-3 animate-pulse select-none"
+        className="w-75 h-14 rounded-lg bg-gray-200 dark:bg-gray-800 flex items-center justify-center"
       >
-        <div className="w-10 h-10 rounded-full bg-black/20 dark:bg-white/20 flex items-center justify-center shrink-0">
-          <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-emerald-500" />
-        </div>
-        <div className="flex-1 flex flex-col gap-1.5">
-          <div className="h-2 w-3/4 bg-black/15 dark:bg-white/15 rounded-full" />
-          <div className="h-2 w-1/2 bg-black/10 dark:bg-white/10 rounded-full" />
-        </div>
+        {loading ? (
+          <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-green-500" />
+        ) : (
+          <button
+            onClick={() => void handleDownload()}
+            className="bg-black/50 p-2 rounded-full text-white hover:bg-black/70"
+          >
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+              <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z" />
+            </svg>
+          </button>
+        )}
       </div>
     )
   }
@@ -439,28 +550,16 @@ export function MediaContent({
       // reserve exactly that; images get their computed final box when the
       // backend knows the dimensions. Both avoid a resize on load.
       className={`${
-        type === "sticker" ? "w-48.75 h-48.75" : "min-w-75 max-w-82.5 max-h-100 w-64 h-64"
-      } relative bg-gray-200 dark:bg-gray-800 rounded-lg flex items-center justify-center overflow-hidden bg-cover bg-center ${
-        thumbnailSrc && type === "image" ? "cursor-pointer" : ""
-      }`}
-      style={{
-        ...(reservedBox ?? undefined),
-        ...(thumbnailSrc ? { backgroundImage: `url(${thumbnailSrc})` } : null),
-      }}
-      onClick={thumbnailSrc && type === "image" ? () => openLightbox(thumbnailSrc) : undefined}
+        type === "sticker" ? "w-48.75 h-48.75" : "w-64 h-64"
+      } bg-gray-200 dark:bg-gray-800 rounded-lg flex items-center justify-center`}
+      style={reservedBox ?? undefined}
     >
       {loading ? (
-        <div className="bg-black/50 p-2.5 rounded-full">
-          <div className="animate-spin rounded-full h-7 w-7 border-b-2 border-white" />
-        </div>
+        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-green-500" />
       ) : (
         <button
-          onClick={e => {
-            e.stopPropagation()
-            void handleDownload()
-          }}
-          className="bg-black/50 p-3 rounded-full text-white hover:bg-black/70 transition-colors"
-          title="Download full media"
+          onClick={() => void handleDownload()}
+          className="bg-black/50 p-3 rounded-full text-white hover:bg-black/70"
         >
           <svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor">
             <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z" />

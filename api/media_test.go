@@ -11,8 +11,8 @@ import (
 	"github.com/lugvitc/whats4linux/internal/cache"
 	"github.com/lugvitc/whats4linux/internal/misc"
 	messageStore "github.com/lugvitc/whats4linux/internal/store"
-	"github.com/polymorfa/hypermeow/proto/waE2E"
-	"github.com/polymorfa/hypermeow/types"
+	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -103,6 +103,9 @@ func TestMediaMethodsHandleUninitialisedAPI(t *testing.T) {
 	if err := a.DownloadImageToFile("message"); err == nil {
 		t.Fatal("DownloadImageToFile returned no error without a message store")
 	}
+	if a.GetImageThumbnail("message") != "" {
+		t.Fatal("GetImageThumbnail returned data without a message store")
+	}
 }
 
 func TestDownloadFileSavesCachedImage(t *testing.T) {
@@ -175,5 +178,15 @@ func TestGetCachedAvatarCanonicalDeviceJID(t *testing.T) {
 	}
 	if !strings.HasPrefix(avatarURL, "data:image/jpeg;base64,") {
 		t.Fatalf("expected data URL, got %q", avatarURL)
+	}
+}
+
+func TestGetCachedImageRejectsNonImageCacheEntry(t *testing.T) {
+	a := newMediaTestAPI(t)
+	if _, err := a.imageCache.SaveImage("doc-1", []byte("%PDF-1.4 hello"), "application/pdf", 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.GetCachedImage("doc-1"); err == nil {
+		t.Fatal("GetCachedImage accepted a cached PDF")
 	}
 }

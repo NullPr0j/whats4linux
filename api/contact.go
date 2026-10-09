@@ -5,8 +5,8 @@ import (
 	"strings"
 
 	"github.com/nyaruka/phonenumbers"
-	"github.com/polymorfa/hypermeow"
-	"github.com/polymorfa/hypermeow/types"
+	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/types"
 )
 
 type Contact struct {

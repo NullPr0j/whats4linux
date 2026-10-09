@@ -8,10 +8,10 @@ import (
 
 	"github.com/lugvitc/whats4linux/internal/misc"
 	"github.com/lugvitc/whats4linux/internal/query"
-	"github.com/polymorfa/hypermeow/proto/waCommon"
-	"github.com/polymorfa/hypermeow/proto/waE2E"
-	"github.com/polymorfa/hypermeow/types"
-	"github.com/polymorfa/hypermeow/types/events"
+	"go.mau.fi/whatsmeow/proto/waCommon"
+	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -264,12 +264,54 @@ func TestGetMessageWithMediaByID(t *testing.T) {
 	}
 }
 
-func TestAntiDeletePreservesMessage(t *testing.T) {
+func TestInsertMessageMediaPreservesGeneratedThumbnail(t *testing.T) {
+	ms := newTestMessageStore(t)
+	const id = "img-1"
+	insertTestMessage(t, ms, id, "123@s.whatsapp.net", 1, "")
+
+	err := ms.runSync(func(tx *sql.Tx) error {
+		_, err := tx.Exec(query.InsertMessageMedia, id, 1, "", "image/jpeg", "", nil, nil, nil, 10, 10, "", 0, []byte("generated"))
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = ms.runSync(func(tx *sql.Tx) error {
+		_, err := tx.Exec(query.InsertMessageMedia, id, 1, "https://example", "image/jpeg", "/p", nil, nil, nil, 12, 12, "", 0, nil)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(ms.GetThumbnail(id)); got != "generated" {
+		t.Fatalf("thumbnail = %q, want generated", got)
+	}
+}
+
+func TestCacheThumbnailUsesWriter(t *testing.T) {
+	ms := newTestMessageStore(t)
+	const id = "img-2"
+	insertTestMessage(t, ms, id, "123@s.whatsapp.net", 1, "")
+	if err := ms.runSync(func(tx *sql.Tx) error {
+		_, err := tx.Exec(query.InsertMessageMedia, id, 1, "", "image/jpeg", "", nil, nil, nil, 10, 10, "", 0, nil)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ms.CacheThumbnail(id, []byte("thumb")); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(ms.GetThumbnail(id)); got != "thumb" {
+		t.Fatalf("thumbnail = %q, want thumb", got)
+	}
+}
+
+func TestRevokedMessageDisplaysPlaceholder(t *testing.T) {
 	ms := newTestMessageStore(t)
 	const (
 		chat = "123@s.whatsapp.net"
-		id   = "msg-anti-delete"
-		text = "Secret text that should not be deleted"
+		id   = "msg-deleted-test"
+		text = "Some text"
 	)
 
 	err := ms.runSync(func(tx *sql.Tx) error {
@@ -799,7 +841,4 @@ func TestChatArchiveAndLatestMessage(t *testing.T) {
 		t.Fatalf("expected chat to no longer be archived")
 	}
 }
-
-
-
 

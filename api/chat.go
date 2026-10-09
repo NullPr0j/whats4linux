@@ -6,9 +6,9 @@ import (
 	"time"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
-	"github.com/polymorfa/hypermeow/appstate"
-	"github.com/polymorfa/hypermeow/proto/waCommon"
-	"github.com/polymorfa/hypermeow/types"
+	"go.mau.fi/whatsmeow/appstate"
+	"go.mau.fi/whatsmeow/proto/waCommon"
+	"go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
 )
 
