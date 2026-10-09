@@ -5,16 +5,18 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"github.com/gen2brain/beeep"
 	"github.com/lugvitc/whats4linux/internal/store"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
-	"go.mau.fi/whatsmeow"
-	"go.mau.fi/whatsmeow/types"
+	"github.com/polymorfa/hypermeow"
+	"github.com/polymorfa/hypermeow/types"
 )
 
 // LinkPreviewResult is the link preview surfaced to the frontend.
@@ -86,10 +88,30 @@ func (a *Api) GetVideoThumbnail(messageID string) string {
 	return "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(thumb)
 }
 
+// GetCachedMedia returns the data URL for any media (image, audio, video) already cached on disk.
+func (a *Api) GetCachedMedia(messageID string) (string, error) {
+	if a.imageCache == nil {
+		return "", fmt.Errorf("image cache is not ready")
+	}
+	data, mime, err := a.imageCache.ReadImageByMessageID(messageID)
+	if err != nil || len(data) == 0 {
+		return "", fmt.Errorf("media not cached")
+	}
+	return "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(data), nil
+}
+
 func (a *Api) DownloadMedia(chatJID string, messageID string) (string, error) {
 	if a.messageStore == nil {
 		return "", fmt.Errorf("message store is not ready")
 	}
+
+	// Check disk cache first before hitting WhatsApp network
+	if a.imageCache != nil {
+		if data, mime, err := a.imageCache.ReadImageByMessageID(messageID); err == nil && len(data) > 0 {
+			return "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(data), nil
+		}
+	}
+
 	msg, err := a.messageStore.GetMessageWithMedia(chatJID, messageID)
 	if err != nil || msg == nil {
 		return "", fmt.Errorf("message not found")
@@ -123,11 +145,11 @@ func (a *Api) DownloadMedia(chatJID string, messageID string) (string, error) {
 		return "", fmt.Errorf("failed to download media: %v", err)
 	}
 
-	// Save to cache for images and stickers
-	if mediaType == whatsmeow.MediaImage {
+	// Save to cache for all media types (images, audio/voice notes, video)
+	if a.imageCache != nil {
 		_, err = a.imageCache.SaveImage(messageID, data, mime, width, height)
 		if err != nil {
-			// Log error but continue
+			log.Printf("[DownloadMedia] Failed to cache media for %s: %v", messageID, err)
 		}
 	}
 
@@ -145,9 +167,17 @@ func (a *Api) downloadMedia(msg *store.ExtendedMessage) ([]byte, string, int, in
 	}
 	data, err := a.waClient.Download(a.ctx, msg.Media)
 	mime := msg.Media.GetMimetype()
-
-	if mime == "" && msg.Media.GetMediaType() == whatsmeow.MediaImage {
-		mime = "image/jpeg"
+	if mime == "" {
+		switch msg.Media.GetMediaType() {
+		case whatsmeow.MediaImage:
+			mime = "image/jpeg"
+		case whatsmeow.MediaVideo:
+			mime = "video/mp4"
+		case whatsmeow.MediaAudio:
+			mime = "audio/ogg"
+		default:
+			mime = "application/octet-stream"
+		}
 	}
 	width, height := msg.Media.GetDimensions()
 
@@ -170,14 +200,25 @@ func (a *Api) GetCachedImage(messageID string) (string, error) {
 	}
 	msg, err := a.messageStore.GetMessageWithMediaByID(messageID)
 	if err != nil || msg == nil {
+		if thumb := a.messageStore.GetThumbnail(messageID); len(thumb) > 0 {
+			return "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(thumb), nil
+		}
 		return "", fmt.Errorf("message not found")
 	}
 	if msg.Media == nil {
+		if thumb := a.messageStore.GetThumbnail(messageID); len(thumb) > 0 {
+			return "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(thumb), nil
+		}
 		return "", fmt.Errorf("message %s has no downloadable image", messageID)
 	}
 
 	data, mime, width, height, err := a.downloadMedia(msg)
 	if err != nil {
+		// If download from WhatsApp servers fails (e.g. expired media or network issue),
+		// fall back to the embedded JPEG thumbnail stored in the message.
+		if thumb := a.messageStore.GetThumbnail(messageID); len(thumb) > 0 {
+			return "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(thumb), nil
+		}
 		return "", fmt.Errorf("failed to download image: %w", err)
 	}
 
@@ -219,8 +260,25 @@ func (a *Api) GetCachedAvatar(jid string, recache bool) (string, error) {
 		return "", fmt.Errorf("image cache is not ready")
 	}
 
-	// Try to get cached avatar data first
+	jidParsed, parseErr := types.ParseJID(jid)
+	canonJIDStr := jid
+	if parseErr == nil {
+		if a.waClient != nil {
+			canonJIDStr = canonicalUserJID(a.ctx, a.waClient, jidParsed).String()
+		} else {
+			canonJIDStr = jidParsed.ToNonAD().String()
+		}
+	}
+
+	// Try to get cached avatar data first (direct JID, then canonical JID)
 	data, mime, err := a.imageCache.ReadAvatarByJID(jid)
+	if err != nil && canonJIDStr != jid {
+		data, mime, err = a.imageCache.ReadAvatarByJID(canonJIDStr)
+		if err == nil && !recache {
+			// Populate the query key as well
+			_, _ = a.imageCache.SaveAvatar(jid, data, mime)
+		}
+	}
 
 	if err == nil && !recache {
 		avatarDataURL := fmt.Sprintf("data:%s;base64,%s", mime, base64.StdEncoding.EncodeToString(data))
@@ -231,29 +289,53 @@ func (a *Api) GetCachedAvatar(jid string, recache bool) (string, error) {
 	if a.waClient == nil || a.waClient.Store == nil {
 		return "", fmt.Errorf("WhatsApp client is not ready")
 	}
-	jidParsed, err := types.ParseJID(jid)
-	if err != nil {
-		return "", fmt.Errorf("invalid JID: %w", err)
+	if parseErr != nil {
+		return "", fmt.Errorf("invalid JID: %w", parseErr)
 	}
 
-	// Get profile picture info. Community parent groups need IsCommunity: true.
-	pic, err := a.waClient.GetProfilePictureInfo(a.ctx, jidParsed, &whatsmeow.GetProfilePictureParams{
-		Preview: false, // Get full resolution
+	// Use canonical non-AD JID for WhatsApp API requests (WhatsApp rejects device JIDs)
+	queryJID := jidParsed.ToNonAD()
+	if a.waClient != nil {
+		queryJID = canonicalUserJID(a.ctx, a.waClient, queryJID)
+	}
+
+	// Get profile picture info. Try full resolution first.
+	pic, err := a.waClient.GetProfilePictureInfo(a.ctx, queryJID, &whatsmeow.GetProfilePictureParams{
+		Preview: false,
 	})
-	if (err != nil || pic == nil) && jidParsed.Server == types.GroupServer {
-		pic, err = a.waClient.GetProfilePictureInfo(a.ctx, jidParsed, &whatsmeow.GetProfilePictureParams{
+	if (err != nil || pic == nil) && queryJID.Server == types.GroupServer {
+		pic, err = a.waClient.GetProfilePictureInfo(a.ctx, queryJID, &whatsmeow.GetProfilePictureParams{
 			Preview:     true,
 			IsCommunity: true,
 		})
 	}
+	// Fall back to standard preview if full-resolution is not available
+	if (err != nil || pic == nil) && queryJID.Server != types.GroupServer {
+		pic, err = a.waClient.GetProfilePictureInfo(a.ctx, queryJID, &whatsmeow.GetProfilePictureParams{
+			Preview: true,
+		})
+	}
 	if err != nil || pic == nil {
 		if recache {
-			a.startBackground(func() { _ = a.imageCache.DeleteAvatar(jid) })
+			a.startBackground(func() {
+				_ = a.imageCache.DeleteAvatar(jid)
+				if canonJIDStr != jid {
+					_ = a.imageCache.DeleteAvatar(canonJIDStr)
+				}
+			})
 		}
 		return "", nil // No avatar available
 	}
 
-	return a.downloadAvatarFromURL(jid, pic.URL)
+	dataURL, dlErr := a.downloadAvatarFromURL(jid, pic.URL)
+	if dlErr == nil && canonJIDStr != jid {
+		// Also cache under canonical JID if different
+		rawBytes, rawMime, rErr := a.imageCache.ReadAvatarByJID(jid)
+		if rErr == nil {
+			_, _ = a.imageCache.SaveAvatar(canonJIDStr, rawBytes, rawMime)
+		}
+	}
+	return dataURL, dlErr
 }
 
 // downloadAvatarFromURL fetches an avatar image from URL, caches it, and
@@ -325,8 +407,9 @@ func (a *Api) GetSelfAvatar(recache bool) (string, error) {
 }
 
 // getFileExtension returns file extension for mime type
-func getFileExtension(mime string) string {
-	switch mime {
+func getFileExtension(mimeType string) string {
+	cleanMime := strings.TrimSpace(strings.Split(mimeType, ";")[0])
+	switch cleanMime {
 	case "image/png":
 		return ".png"
 	case "image/gif":
@@ -335,32 +418,162 @@ func getFileExtension(mime string) string {
 		return ".webp"
 	case "image/jpeg", "image/jpg":
 		return ".jpg"
+	case "video/mp4":
+		return ".mp4"
+	case "video/3gpp":
+		return ".3gp"
+	case "video/quicktime":
+		return ".mov"
+	case "audio/ogg":
+		return ".ogg"
+	case "audio/mpeg", "audio/mp3":
+		return ".mp3"
+	case "audio/mp4", "audio/m4a":
+		return ".m4a"
+	case "audio/aac":
+		return ".aac"
+	case "application/pdf":
+		return ".pdf"
+	case "application/zip":
+		return ".zip"
+	case "application/msword":
+		return ".doc"
+	case "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+		return ".docx"
+	case "application/vnd.ms-excel":
+		return ".xls"
+	case "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
+		return ".xlsx"
 	default:
-		return ".jpg"
+		if exts, err := mime.ExtensionsByType(cleanMime); err == nil && len(exts) > 0 {
+			return exts[0]
+		}
+		return ".bin"
 	}
 }
 
-// DownloadImageToFile downloads an image from cache to the Downloads folder
-func (a *Api) DownloadImageToFile(messageID string) error {
-	data, mime, err := a.imageCache.ReadImageByMessageID(messageID)
+// GetDownloadDirectory returns the configured download directory or ~/Downloads/Whats4L by default.
+func (a *Api) GetDownloadDirectory() string {
+	homeDir, err := os.UserHomeDir()
 	if err != nil {
-		return err
+		homeDir = "."
+	}
+	defaultDir := filepath.Join(homeDir, "Downloads", "Whats4L")
+
+	s := store.GetSettings()
+	var customDir string
+	if d, ok := s["downloadDir"].(string); ok && strings.TrimSpace(d) != "" {
+		customDir = strings.TrimSpace(d)
+	} else if d, ok := s["download_dir"].(string); ok && strings.TrimSpace(d) != "" {
+		customDir = strings.TrimSpace(d)
 	}
 
-	homeDir, _ := os.UserHomeDir()
-	downloadsDir := filepath.Join(homeDir, "Downloads")
-	fileName := messageID + getFileExtension(mime)
+	if customDir != "" {
+		if strings.HasPrefix(customDir, "~/") {
+			customDir = filepath.Join(homeDir, customDir[2:])
+		} else if customDir == "~" {
+			customDir = homeDir
+		}
+		return customDir
+	}
+
+	return defaultDir
+}
+
+// SetDownloadDirectory persists the custom download directory to settings.
+func (a *Api) SetDownloadDirectory(dir string) error {
+	s := store.GetSettings()
+	if s == nil {
+		s = make(map[string]any)
+	}
+	s["downloadDir"] = strings.TrimSpace(dir)
+	return store.SaveSettings(s)
+}
+
+// SelectDownloadDirectory opens a native directory picker dialog for the download folder.
+func (a *Api) SelectDownloadDirectory() (string, error) {
+	currentDir := a.GetDownloadDirectory()
+	_ = os.MkdirAll(currentDir, 0755)
+
+	if a.ctx == nil {
+		return "", fmt.Errorf("context not available")
+	}
+
+	dir, err := runtime.OpenDirectoryDialog(a.ctx, runtime.OpenDialogOptions{
+		DefaultDirectory: currentDir,
+		Title:            "Select Download Directory",
+	})
+	if err != nil {
+		return "", err
+	}
+	if dir != "" {
+		if err := a.SetDownloadDirectory(dir); err != nil {
+			return "", err
+		}
+	}
+	return dir, nil
+}
+
+// DownloadFile downloads any media (image, document, video, audio) to the configured download folder
+func (a *Api) DownloadFile(messageID string) error {
+	var (
+		data []byte
+		mimeType string
+		msg  *store.ExtendedMessage
+		err  error
+	)
+
+	// Check image cache first if available
+	if a.imageCache != nil {
+		data, mimeType, _ = a.imageCache.ReadImageByMessageID(messageID)
+	}
+
+	// If not in cache, fetch the message and download the media directly
+	if len(data) == 0 {
+		if a.messageStore == nil {
+			return fmt.Errorf("message store is not ready")
+		}
+		msg, err = a.messageStore.GetMessageWithMediaByID(messageID)
+		if err != nil || msg == nil || msg.Media == nil {
+			return fmt.Errorf("message %s has no downloadable media", messageID)
+		}
+		var width, height int
+		data, mimeType, width, height, err = a.downloadMedia(msg)
+		if err != nil {
+			return fmt.Errorf("failed to download media: %w", err)
+		}
+		if a.imageCache != nil {
+			_, _ = a.imageCache.SaveImage(messageID, data, mimeType, width, height)
+		}
+	} else if a.messageStore != nil {
+		msg, _ = a.messageStore.GetMessageWithMediaByID(messageID)
+	}
+
+	fileName := ""
+	if msg != nil && msg.Media != nil {
+		fileName = msg.Media.GetFileName()
+	}
+	if fileName == "" {
+		fileName = messageID + getFileExtension(mimeType)
+	} else if filepath.Ext(fileName) == "" {
+		fileName += getFileExtension(mimeType)
+	}
+	fileName = filepath.Base(fileName)
+
+	downloadsDir := a.GetDownloadDirectory()
+	_ = os.MkdirAll(downloadsDir, 0755)
 	filePath := filepath.Join(downloadsDir, fileName)
 
 	// Check if file exists and prompt for new path
 	if _, err := os.Stat(filePath); err == nil {
-		if filePath, err = runtime.SaveFileDialog(a.ctx, runtime.SaveDialogOptions{
-			DefaultDirectory: downloadsDir,
-			DefaultFilename:  fileName,
-			Title:            "File already exists. Save as...",
-			Filters:          []runtime.FileFilter{{DisplayName: "Image Files", Pattern: "*" + getFileExtension(mime)}},
-		}); err != nil || filePath == "" {
-			return err
+		if a.ctx != nil && a.ctx.Value("frontend") != nil {
+			if filePath, err = runtime.SaveFileDialog(a.ctx, runtime.SaveDialogOptions{
+				DefaultDirectory: downloadsDir,
+				DefaultFilename:  fileName,
+				Title:            "File already exists. Save as...",
+			}); err != nil || filePath == "" {
+				return err
+			}
 		}
 	}
 
@@ -368,7 +581,9 @@ func (a *Api) DownloadImageToFile(messageID string) error {
 		return err
 	}
 
-	beeep.Notify("whats4linux", "Downloaded: "+filePath, "")
+	savedFileName := filepath.Base(filePath)
+	a.emit("download:complete", savedFileName)
+	beeep.Notify("whats4linux", "Downloaded: "+savedFileName, "")
 	go func() {
 		if _, err := exec.LookPath("mpg123"); err == nil {
 			exec.Command("mpg123", "./beep.mp3").Run()
@@ -376,3 +591,103 @@ func (a *Api) DownloadImageToFile(messageID string) error {
 	}()
 	return nil
 }
+
+// DownloadImageToFile downloads an image or file to the Downloads folder (kept for backward compatibility)
+func (a *Api) DownloadImageToFile(messageID string) error {
+	return a.DownloadFile(messageID)
+}
+
+func (a *Api) ensureMediaFile(messageID string) (string, []byte, string, error) {
+	downloadsDir := a.GetDownloadDirectory()
+	_ = os.MkdirAll(downloadsDir, 0755)
+
+	if a.messageStore == nil {
+		return "", nil, "", fmt.Errorf("message store is not ready")
+	}
+	msg, err := a.messageStore.GetMessageWithMediaByID(messageID)
+	if err != nil || msg == nil || msg.Media == nil {
+		return "", nil, "", fmt.Errorf("message %s has no downloadable media", messageID)
+	}
+
+	fileName := msg.Media.GetFileName()
+	mimeType := msg.Media.GetMimetype()
+	if mimeType == "" {
+		mimeType = "application/pdf"
+	}
+	if fileName == "" {
+		fileName = messageID + getFileExtension(mimeType)
+	} else if filepath.Ext(fileName) == "" {
+		fileName += getFileExtension(mimeType)
+	}
+	fileName = filepath.Base(fileName)
+	filePath := filepath.Join(downloadsDir, fileName)
+
+	// If file already exists on disk and is non-empty, use it
+	if info, err := os.Stat(filePath); err == nil && info.Size() > 0 {
+		data, _ := os.ReadFile(filePath)
+		return filePath, data, mimeType, nil
+	}
+
+	// Also check legacy ~/Downloads in case it was previously saved there
+	if homeDir, err := os.UserHomeDir(); err == nil {
+		legacyPath := filepath.Join(homeDir, "Downloads", fileName)
+		if legacyPath != filePath {
+			if info, err := os.Stat(legacyPath); err == nil && info.Size() > 0 {
+				data, _ := os.ReadFile(legacyPath)
+				return legacyPath, data, mimeType, nil
+			}
+		}
+	}
+
+	// Download from WhatsApp
+	data, mimeType, width, height, err := a.downloadMedia(msg)
+	if err != nil {
+		return "", nil, "", fmt.Errorf("failed to download media: %w", err)
+	}
+
+	if a.imageCache != nil {
+		_, _ = a.imageCache.SaveImage(messageID, data, mimeType, width, height)
+	}
+
+	if err := os.WriteFile(filePath, data, 0644); err != nil {
+		return "", nil, "", err
+	}
+
+	return filePath, data, mimeType, nil
+}
+
+// OpenDocument downloads the document if needed and opens it with the default system application (e.g. PDF viewer)
+func (a *Api) OpenDocument(messageID string) error {
+	filePath, _, _, err := a.ensureMediaFile(messageID)
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command("xdg-open", filePath)
+	return cmd.Start()
+}
+
+// OpenDocumentInBrowser downloads the document if needed and opens it in the default web browser
+func (a *Api) OpenDocumentInBrowser(messageID string) error {
+	filePath, _, _, err := a.ensureMediaFile(messageID)
+	if err != nil {
+		return err
+	}
+	if a.ctx != nil {
+		runtime.BrowserOpenURL(a.ctx, "file://"+filePath)
+		return nil
+	}
+	return exec.Command("xdg-open", filePath).Start()
+}
+
+// GetDocumentDataURL returns the document as a data URL for in-app preview
+func (a *Api) GetDocumentDataURL(messageID string) (string, error) {
+	_, data, mimeType, err := a.ensureMediaFile(messageID)
+	if err != nil {
+		return "", err
+	}
+	if mimeType == "" {
+		mimeType = "application/pdf"
+	}
+	return fmt.Sprintf("data:%s;base64,%s", mimeType, base64.StdEncoding.EncodeToString(data)), nil
+}
+

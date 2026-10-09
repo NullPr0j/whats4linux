@@ -11,11 +11,11 @@ import (
 	"github.com/lugvitc/whats4linux/internal/store"
 	mtypes "github.com/lugvitc/whats4linux/internal/types"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
-	"go.mau.fi/whatsmeow"
-	"go.mau.fi/whatsmeow/proto/waCommon"
-	"go.mau.fi/whatsmeow/proto/waE2E"
-	"go.mau.fi/whatsmeow/types"
-	"go.mau.fi/whatsmeow/types/events"
+	"github.com/polymorfa/hypermeow"
+	"github.com/polymorfa/hypermeow/proto/waCommon"
+	"github.com/polymorfa/hypermeow/proto/waE2E"
+	"github.com/polymorfa/hypermeow/types"
+	"github.com/polymorfa/hypermeow/types/events"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -28,6 +28,8 @@ type MessageContent struct {
 	QuotedMessageID string   `json:"quotedMessageId,omitempty"`
 	Mentions        []string `json:"mentions,omitempty"`
 	ClientTempID    string   `json:"clientTempId,omitempty"`
+	Ptt             bool     `json:"ptt,omitempty"`
+	Seconds         uint32   `json:"seconds,omitempty"`
 }
 
 func (a *Api) processMessageText(msg *waE2E.Message) string {
@@ -91,16 +93,11 @@ func buildQuotedMessage(msg *store.ExtendedMessage) *waE2E.Message {
 	if msg == nil {
 		return nil
 	}
+	cleanText := markdown.HTMLToPlainText(msg.Text)
 	var quotedMessage waE2E.Message
-	if msg.ReplyToMessageID == "" {
-		quotedMessage.Conversation = proto.String(msg.Text)
-	} else {
-		quotedMessage.ExtendedTextMessage = &waE2E.ExtendedTextMessage{
-			Text: proto.String(msg.Text),
-		}
-	}
 
 	if msg.Media == nil {
+		quotedMessage.Conversation = proto.String(cleanText)
 		return &quotedMessage
 	}
 
@@ -110,7 +107,7 @@ func buildQuotedMessage(msg *store.ExtendedMessage) *waE2E.Message {
 		quotedMessage.ImageMessage = &waE2E.ImageMessage{
 			URL:           proto.String(msg.Media.GetURL()),
 			Mimetype:      proto.String(msg.Media.GetMimetype()),
-			Caption:       proto.String(msg.Text),
+			Caption:       proto.String(cleanText),
 			FileSHA256:    msg.Media.GetFileSHA256(),
 			Width:         proto.Uint32(uint32(width)),
 			Height:        proto.Uint32(uint32(height)),
@@ -121,7 +118,7 @@ func buildQuotedMessage(msg *store.ExtendedMessage) *waE2E.Message {
 		quotedMessage.VideoMessage = &waE2E.VideoMessage{
 			URL:           proto.String(msg.Media.GetURL()),
 			Mimetype:      proto.String(msg.Media.GetMimetype()),
-			Caption:       proto.String(msg.Text),
+			Caption:       proto.String(cleanText),
 			FileSHA256:    msg.Media.GetFileSHA256(),
 			FileEncSHA256: msg.Media.GetFileEncSHA256(),
 			DirectPath:    proto.String(msg.Media.GetDirectPath()),
@@ -135,10 +132,16 @@ func buildQuotedMessage(msg *store.ExtendedMessage) *waE2E.Message {
 			DirectPath:    proto.String(msg.Media.GetDirectPath()),
 		}
 	case mtypes.MediaTypeDocument:
+		fileName := msg.Media.GetFileName()
+		if fileName == "" {
+			fileName = "Document"
+		}
 		quotedMessage.DocumentMessage = &waE2E.DocumentMessage{
 			URL:           proto.String(msg.Media.GetURL()),
 			Mimetype:      proto.String(msg.Media.GetMimetype()),
-			Caption:       proto.String(msg.Text),
+			Title:         proto.String(fileName),
+			FileName:      proto.String(fileName),
+			Caption:       proto.String(cleanText),
 			FileSHA256:    msg.Media.GetFileSHA256(),
 			FileEncSHA256: msg.Media.GetFileEncSHA256(),
 			DirectPath:    proto.String(msg.Media.GetDirectPath()),
@@ -151,9 +154,106 @@ func buildQuotedMessage(msg *store.ExtendedMessage) *waE2E.Message {
 			FileEncSHA256: msg.Media.GetFileEncSHA256(),
 			DirectPath:    proto.String(msg.Media.GetDirectPath()),
 		}
+	default:
+		quotedMessage.Conversation = proto.String(cleanText)
 	}
 
 	return &quotedMessage
+}
+
+func buildForwardedMessage(msg *store.ExtendedMessage) *waE2E.Message {
+	if msg == nil {
+		return nil
+	}
+
+	cleanText := markdown.HTMLToPlainText(msg.Text)
+
+	contextInfo := &waE2E.ContextInfo{
+		IsForwarded:     proto.Bool(true),
+		ForwardingScore: proto.Uint32(1),
+	}
+
+	forwardedMsg := &waE2E.Message{}
+
+	if msg.Media == nil {
+		forwardedMsg.ExtendedTextMessage = &waE2E.ExtendedTextMessage{
+			Text:        proto.String(cleanText),
+			ContextInfo: contextInfo,
+		}
+		return forwardedMsg
+	}
+
+	switch msg.Media.GetMediaGeneralType() {
+	case mtypes.MediaTypeImage:
+		width, height := msg.Media.GetDimensions()
+		forwardedMsg.ImageMessage = &waE2E.ImageMessage{
+			URL:           proto.String(msg.Media.GetURL()),
+			Mimetype:      proto.String(msg.Media.GetMimetype()),
+			Caption:       proto.String(cleanText),
+			FileSHA256:    msg.Media.GetFileSHA256(),
+			Width:         proto.Uint32(uint32(width)),
+			Height:        proto.Uint32(uint32(height)),
+			FileEncSHA256: msg.Media.GetFileEncSHA256(),
+			DirectPath:    proto.String(msg.Media.GetDirectPath()),
+			MediaKey:      msg.Media.GetMediaKey(),
+			ContextInfo:   contextInfo,
+		}
+	case mtypes.MediaTypeVideo:
+		forwardedMsg.VideoMessage = &waE2E.VideoMessage{
+			URL:           proto.String(msg.Media.GetURL()),
+			Mimetype:      proto.String(msg.Media.GetMimetype()),
+			Caption:       proto.String(cleanText),
+			FileSHA256:    msg.Media.GetFileSHA256(),
+			FileEncSHA256: msg.Media.GetFileEncSHA256(),
+			DirectPath:    proto.String(msg.Media.GetDirectPath()),
+			MediaKey:      msg.Media.GetMediaKey(),
+			ContextInfo:   contextInfo,
+		}
+	case mtypes.MediaTypeAudio:
+		forwardedMsg.AudioMessage = &waE2E.AudioMessage{
+			URL:           proto.String(msg.Media.GetURL()),
+			Mimetype:      proto.String(msg.Media.GetMimetype()),
+			FileSHA256:    msg.Media.GetFileSHA256(),
+			FileEncSHA256: msg.Media.GetFileEncSHA256(),
+			DirectPath:    proto.String(msg.Media.GetDirectPath()),
+			MediaKey:      msg.Media.GetMediaKey(),
+			ContextInfo:   contextInfo,
+		}
+	case mtypes.MediaTypeDocument:
+		fileName := msg.Media.GetFileName()
+		if fileName == "" {
+			fileName = "Document"
+		}
+		forwardedMsg.DocumentMessage = &waE2E.DocumentMessage{
+			URL:           proto.String(msg.Media.GetURL()),
+			Mimetype:      proto.String(msg.Media.GetMimetype()),
+			Title:         proto.String(fileName),
+			FileName:      proto.String(fileName),
+			Caption:       proto.String(cleanText),
+			FileSHA256:    msg.Media.GetFileSHA256(),
+			FileEncSHA256: msg.Media.GetFileEncSHA256(),
+			DirectPath:    proto.String(msg.Media.GetDirectPath()),
+			MediaKey:      msg.Media.GetMediaKey(),
+			ContextInfo:   contextInfo,
+		}
+	case mtypes.MediaTypeSticker:
+		forwardedMsg.StickerMessage = &waE2E.StickerMessage{
+			URL:           proto.String(msg.Media.GetURL()),
+			Mimetype:      proto.String(msg.Media.GetMimetype()),
+			FileSHA256:    msg.Media.GetFileSHA256(),
+			FileEncSHA256: msg.Media.GetFileEncSHA256(),
+			DirectPath:    proto.String(msg.Media.GetDirectPath()),
+			MediaKey:      msg.Media.GetMediaKey(),
+			ContextInfo:   contextInfo,
+		}
+	default:
+		forwardedMsg.ExtendedTextMessage = &waE2E.ExtendedTextMessage{
+			Text:        proto.String(cleanText),
+			ContextInfo: contextInfo,
+		}
+	}
+
+	return forwardedMsg
 }
 
 func (a *Api) buildQuotedContext(chatJID types.JID, quotedMessageID string) (*waE2E.ContextInfo, error) {
@@ -161,26 +261,41 @@ func (a *Api) buildQuotedContext(chatJID types.JID, quotedMessageID string) (*wa
 		return nil, nil
 	}
 
-	msg, err := a.messageStore.GetMessageWithMedia(chatJID.String(), quotedMessageID)
-	if err != nil {
-		return nil, fmt.Errorf("quoted message not found")
-	}
-
-	quotedMessage := buildQuotedMessage(msg)
-
-	if quotedMessage == nil {
-		return nil, fmt.Errorf("failed to build quoted message")
+	var msg *store.ExtendedMessage
+	var err error
+	if a.messageStore != nil {
+		msg, err = a.messageStore.GetMessageWithMedia(chatJID.String(), quotedMessageID)
+		if err != nil || msg == nil {
+			msg, err = a.messageStore.GetMessageWithMediaByID(quotedMessageID)
+		}
 	}
 
 	stanzaID := quotedMessageID
 	contextInfo := &waE2E.ContextInfo{
-		StanzaID:      &stanzaID,
-		QuotedMessage: quotedMessage,
+		StanzaID: &stanzaID,
 	}
 
-	if msg.Info.Sender.User != "" {
-		participantJID := msg.Info.Sender.ToNonAD().String()
-		contextInfo.Participant = proto.String(participantJID)
+	if msg != nil {
+		contextInfo.QuotedMessage = buildQuotedMessage(msg)
+
+		if chatJID.Server == types.GroupServer {
+			if msg.Info.IsFromMe && a.waClient != nil && a.waClient.Store != nil && a.waClient.Store.ID != nil {
+				contextInfo.Participant = proto.String(a.waClient.Store.ID.ToNonAD().String())
+			} else if msg.Info.Sender.User != "" {
+				contextInfo.Participant = proto.String(msg.Info.Sender.ToNonAD().String())
+			}
+		} else {
+			if msg.Info.IsFromMe && a.waClient != nil && a.waClient.Store != nil && a.waClient.Store.ID != nil {
+				contextInfo.Participant = proto.String(a.waClient.Store.ID.ToNonAD().String())
+			} else {
+				contextInfo.Participant = proto.String(chatJID.ToNonAD().String())
+			}
+		}
+	} else {
+		// Even if not in local store, populate participant for 1-on-1 chats
+		if chatJID.Server != types.GroupServer {
+			contextInfo.Participant = proto.String(chatJID.ToNonAD().String())
+		}
 	}
 
 	return contextInfo, nil
@@ -350,10 +465,14 @@ func (a *Api) SendMessage(chatJID string, content MessageContent) (string, error
 		// Create audio message
 		mimeType := content.Mimetype
 		if mimeType == "" {
-			mimeType = "audio/ogg"
+			mimeType = "audio/ogg; codecs=opus"
 		}
 		audioMsg := &waE2E.AudioMessage{
 			Mimetype: &mimeType,
+			PTT:      proto.Bool(content.Ptt),
+		}
+		if content.Seconds > 0 {
+			audioMsg.Seconds = proto.Uint32(content.Seconds)
 		}
 
 		if contextInfo != nil {
@@ -497,7 +616,11 @@ func (a *Api) SendMessage(chatJID string, content MessageContent) (string, error
 		case msgContent.GetVideoMessage() != nil:
 			messageText = "video"
 		case msgContent.GetAudioMessage() != nil:
-			messageText = "audio"
+			if msgContent.GetAudioMessage().GetPTT() {
+				messageText = "voice message"
+			} else {
+				messageText = "audio"
+			}
 		case msgContent.GetDocumentMessage() != nil:
 			messageText = "document"
 		case msgContent.GetStickerMessage() != nil:
@@ -537,6 +660,82 @@ func (a *Api) SendMessage(chatJID string, content MessageContent) (string, error
 
 	return resp.ID, nil
 }
+
+// ForwardMessage forwards an existing message to one or more target chats.
+func (a *Api) ForwardMessage(messageID string, targetChatJIDs []string) error {
+	if a.waClient == nil || a.waClient.Store == nil || a.waClient.Store.ID == nil {
+		return fmt.Errorf("client not logged in")
+	}
+	if a.messageStore == nil {
+		return fmt.Errorf("message store is not ready")
+	}
+	if len(targetChatJIDs) == 0 {
+		return fmt.Errorf("no target chats specified")
+	}
+
+	msg, err := a.messageStore.GetMessageWithMediaByID(messageID)
+	if err != nil || msg == nil {
+		return fmt.Errorf("message not found: %w", err)
+	}
+
+	forwardedMsg := buildForwardedMessage(msg)
+	if forwardedMsg == nil {
+		return fmt.Errorf("failed to build forwarded message")
+	}
+
+	var sentCount int
+	var lastErr error
+	for _, targetJIDStr := range targetChatJIDs {
+		targetJID, err := types.ParseJID(targetJIDStr)
+		if err != nil {
+			lastErr = fmt.Errorf("invalid JID %s: %w", targetJIDStr, err)
+			continue
+		}
+
+		resp, err := a.waClient.SendMessage(a.ctx, targetJID, forwardedMsg)
+		if err != nil {
+			log.Printf("Failed to forward message to %s: %v", targetJIDStr, err)
+			lastErr = err
+			continue
+		}
+
+		sentCount++
+
+		// Manually add to store and emit event so UI updates immediately
+		msgEvent := &events.Message{
+			Info: types.MessageInfo{
+				ID:        resp.ID,
+				Timestamp: resp.Timestamp,
+				MessageSource: types.MessageSource{
+					Chat:     targetJID,
+					IsFromMe: true,
+					Sender:   *a.waClient.Store.ID,
+				},
+			},
+			Message: forwardedMsg,
+		}
+		parsedHTML := a.processMessageText(forwardedMsg)
+		newMsgID := a.messageStore.ProcessMessageEvent(a.ctx, a.waClient.Store.LIDs, msgEvent, parsedHTML)
+
+		var sentDecodedMsg any
+		if newMsgID != "" {
+			if decoded, err := a.messageStore.GetDecodedMessage(targetJID.String(), newMsgID); err == nil {
+				sentDecodedMsg = decoded
+			}
+		}
+
+		a.emit("wa:new_message", map[string]any{
+			"chatId":  targetJID.String(),
+			"message": sentDecodedMsg,
+		})
+	}
+
+	if sentCount == 0 && lastErr != nil {
+		return lastErr
+	}
+	return nil
+}
+
 func (a *Api) MarkRead(chatJID string, messageIDs []string, Type string) error {
 	parsedChatJID, err := types.ParseJID(chatJID)
 	if err != nil {
@@ -557,6 +756,98 @@ func (a *Api) MarkRead(chatJID string, messageIDs []string, Type string) error {
 			}
 		}
 	}
+	return nil
+}
+
+// EditMessage edits a previously sent text message.
+func (a *Api) EditMessage(chatJID string, messageID string, newText string) error {
+	if a.waClient == nil || a.waClient.Store == nil || a.waClient.Store.ID == nil {
+		return fmt.Errorf("client not logged in")
+	}
+	chat, err := types.ParseJID(chatJID)
+	if err != nil {
+		return err
+	}
+
+	if a.messageStore != nil {
+		msg, err := a.messageStore.GetMessageWithMediaByID(messageID)
+		if err == nil && msg != nil {
+			if !msg.Info.IsFromMe {
+				return fmt.Errorf("cannot edit messages from other senders")
+			}
+			if msg.IsDeleted {
+				return fmt.Errorf("cannot edit deleted messages")
+			}
+			if msg.Media != nil {
+				return fmt.Errorf("cannot edit media messages")
+			}
+			if time.Since(msg.Info.Timestamp) > 15*time.Minute {
+				return fmt.Errorf("message is too old to edit (WhatsApp edit window is 15 minutes)")
+			}
+		}
+	}
+
+	newContent := &waE2E.Message{
+		Conversation: proto.String(newText),
+	}
+	editMsg := a.waClient.BuildEdit(chat, types.MessageID(messageID), newContent)
+
+	_, err = a.waClient.SendMessage(a.ctx, chat, editMsg)
+	if err != nil {
+		return fmt.Errorf("failed to send edit: %w", err)
+	}
+
+	// Update local store immediately
+	parsedHTML := a.processMessageText(newContent)
+	if a.messageStore != nil {
+		_ = a.messageStore.UpdateMessageContent(nil, messageID, newContent, parsedHTML, time.Now().Unix())
+		if updatedMsg, err := a.messageStore.GetDecodedMessage(chatJID, messageID); err == nil {
+			runtime.EventsEmit(a.ctx, "wa:new_message", map[string]any{
+				"chatId":      chatJID,
+				"message":     updatedMsg,
+				"messageText": parsedHTML,
+			})
+		}
+	}
+
+	return nil
+}
+
+// DeleteMessage revokes a message for everyone or deletes it locally for the current user.
+func (a *Api) DeleteMessage(chatJID string, messageID string, forEveryone bool) error {
+	if a.waClient == nil || a.waClient.Store == nil || a.waClient.Store.ID == nil {
+		return fmt.Errorf("client not logged in")
+	}
+	chat, err := types.ParseJID(chatJID)
+	if err != nil {
+		return err
+	}
+
+	if forEveryone {
+		revokeMsg := a.waClient.BuildRevoke(chat, types.EmptyJID, types.MessageID(messageID))
+		_, err = a.waClient.SendMessage(a.ctx, chat, revokeMsg)
+		if err != nil {
+			return fmt.Errorf("failed to revoke message: %w", err)
+		}
+		if a.messageStore != nil {
+			_ = a.messageStore.MarkMessageDeleted(messageID)
+			if updatedMsg, err := a.messageStore.GetDecodedMessage(chatJID, messageID); err == nil {
+				runtime.EventsEmit(a.ctx, "wa:new_message", map[string]any{
+					"chatId":  chatJID,
+					"message": updatedMsg,
+				})
+			}
+		}
+	} else {
+		if a.messageStore != nil {
+			_ = a.messageStore.DeleteMessageLocally(messageID)
+			runtime.EventsEmit(a.ctx, "wa:message_deleted", map[string]any{
+				"chatId":    chatJID,
+				"messageId": messageID,
+			})
+		}
+	}
+
 	return nil
 }
 
@@ -707,3 +998,4 @@ func (a *Api) SendShareContact(chatJID, displayName, phone string) (string, erro
 	}
 	return a.sendAndStoreLocal(chat, msg, "👤 "+displayName)
 }
+

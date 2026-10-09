@@ -6,6 +6,8 @@ import {
   SendIcon,
   CloseIcon,
   UserAvatar,
+  MicIcon,
+  TrashIcon,
 } from "../../assets/svgs/chat_icons"
 import { store } from "../../../wailsjs/go/models"
 import { GetCachedAvatar } from "../../../wailsjs/go/api/Api"
@@ -26,6 +28,7 @@ interface ChatInputProps {
   emojiPickerRef: React.RefObject<HTMLDivElement | null>
   emojiButtonRef: React.RefObject<HTMLButtonElement | null>
   replyingTo: store.DecodedMessage | null
+  editingMessage?: store.DecodedMessage | null
   mentionableContacts: any[]
   onInputChange: (e: React.ChangeEvent<HTMLTextAreaElement>) => void
   onKeyDown: (e: React.KeyboardEvent) => void
@@ -36,8 +39,10 @@ interface ChatInputProps {
   onEmojiClick: (emoji: string) => void
   onToggleEmojiPicker: () => void
   onCancelReply: () => void
+  onCancelEdit?: () => void
   onMentionAdd: (contact: any) => void
   selectedMentions: any[]
+  onSendVoiceNote?: (base64Data: string, mimetype: string, durationSeconds: number) => void
 }
 
 const FILE_TYPE_ICONS = {
@@ -123,6 +128,7 @@ export function ChatInput({
   emojiPickerRef,
   emojiButtonRef,
   replyingTo,
+  editingMessage,
   mentionableContacts,
   onInputChange,
   onKeyDown,
@@ -133,8 +139,10 @@ export function ChatInput({
   onEmojiClick,
   onToggleEmojiPicker,
   onCancelReply,
+  onCancelEdit,
   onMentionAdd,
   selectedMentions,
+  onSendVoiceNote,
 }: ChatInputProps) {
   const [mentionSuggestions, setMentionSuggestions] = useState<any[]>([])
   const [attachMenuOpen, setAttachMenuOpen] = useState(false)
@@ -144,9 +152,43 @@ export function ChatInput({
   const [showSuggestions, setShowSuggestions] = useState(false)
   const [mentionAvatars, setMentionAvatars] = useState<Record<string, string>>({})
   const [loadingAvatars, setLoadingAvatars] = useState<Record<string, boolean>>({})
+  const [isMultiline, setIsMultiline] = useState(false)
+
+  // Voice recording state
+  const [isRecording, setIsRecording] = useState(false)
+  const [recordingDuration, setRecordingDuration] = useState(0)
+  const [recordingError, setRecordingError] = useState<string | null>(null)
+
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null)
+  const audioStreamRef = useRef<MediaStream | null>(null)
+  const audioChunksRef = useRef<Blob[]>([])
+  const recordingTimerRef = useRef<NodeJS.Timeout | null>(null)
+  const shouldSendAudioRef = useRef(false)
+  const recordingDurationRef = useRef(0)
+
   const avatarCacheRef = useRef<Record<string, string>>({})
   const suggestionsRef = useRef<HTMLDivElement>(null)
   const backdropRef = useRef<HTMLDivElement>(null)
+
+  // Auto-resize textarea and keep backdrop height synchronized
+  useEffect(() => {
+    const el = textareaRef?.current
+    if (!el) return
+
+    // Reset height to auto to recalculate actual scrollHeight
+    el.style.height = "auto"
+    const scrollHeight = el.scrollHeight
+
+    // Minimum single-line height ~36px, max ~140px (~5-6 lines)
+    const targetHeight = Math.min(Math.max(scrollHeight, 36), 140)
+    el.style.height = `${targetHeight}px`
+    setIsMultiline(scrollHeight > 44)
+
+    if (backdropRef.current) {
+      backdropRef.current.style.height = `${targetHeight}px`
+      backdropRef.current.scrollTop = el.scrollTop
+    }
+  }, [inputText, textareaRef])
 
   const handleScroll = () => {
     if (textareaRef.current && backdropRef.current) {
@@ -154,9 +196,129 @@ export function ChatInput({
     }
   }
 
+  const formatTimer = (seconds: number) => {
+    const m = Math.floor(seconds / 60)
+    const s = seconds % 60
+    return `${m}:${s < 10 ? "0" : ""}${s}`
+  }
+
+  const startVoiceRecording = async () => {
+    setRecordingError(null)
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setRecordingError("Microphone not supported on this device.")
+      return
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      audioStreamRef.current = stream
+
+      let mimeType = "audio/webm; codecs=opus"
+      if (typeof MediaRecorder.isTypeSupported === "function") {
+        if (MediaRecorder.isTypeSupported("audio/ogg; codecs=opus")) {
+          mimeType = "audio/ogg; codecs=opus"
+        } else if (MediaRecorder.isTypeSupported("audio/webm; codecs=opus")) {
+          mimeType = "audio/webm; codecs=opus"
+        } else if (MediaRecorder.isTypeSupported("audio/webm")) {
+          mimeType = "audio/webm"
+        }
+      }
+
+      const recorder = new MediaRecorder(stream, { mimeType })
+      mediaRecorderRef.current = recorder
+      audioChunksRef.current = []
+      shouldSendAudioRef.current = false
+      recordingDurationRef.current = 0
+      setRecordingDuration(0)
+
+      recorder.ondataavailable = e => {
+        if (e.data && e.data.size > 0) {
+          audioChunksRef.current.push(e.data)
+        }
+      }
+
+      recorder.onstop = () => {
+        if (shouldSendAudioRef.current && audioChunksRef.current.length > 0) {
+          const blob = new Blob(audioChunksRef.current, { type: mimeType })
+          const duration = recordingDurationRef.current
+          const reader = new FileReader()
+          reader.onloadend = () => {
+            const result = reader.result as string
+            if (result && onSendVoiceNote) {
+              const base64 = result.split(",")[1]
+              onSendVoiceNote(base64, mimeType, Math.max(duration, 1))
+            }
+          }
+          reader.readAsDataURL(blob)
+        }
+
+        stream.getTracks().forEach(track => track.stop())
+        audioStreamRef.current = null
+        mediaRecorderRef.current = null
+        setIsRecording(false)
+        if (recordingTimerRef.current) {
+          clearInterval(recordingTimerRef.current)
+          recordingTimerRef.current = null
+        }
+      }
+
+      recorder.start(200)
+      setIsRecording(true)
+
+      recordingTimerRef.current = setInterval(() => {
+        recordingDurationRef.current += 1
+        setRecordingDuration(recordingDurationRef.current)
+      }, 1000)
+    } catch (err: any) {
+      console.error("Failed to start voice recording:", err)
+      let msg = err?.message || "Microphone access denied"
+      if (err?.name === "NotAllowedError" || msg.includes("not allowed")) {
+        msg = "Microphone permission was blocked. Restart the app to apply permissions."
+      } else if (err?.name === "NotFoundError" || msg.includes("NotFound")) {
+        msg = "No microphone input device detected on your system."
+      }
+      setRecordingError(msg)
+      setTimeout(() => setRecordingError(null), 5000)
+    }
+  }
+
+  const cancelVoiceRecording = () => {
+    shouldSendAudioRef.current = false
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+      mediaRecorderRef.current.stop()
+    } else {
+      audioStreamRef.current?.getTracks().forEach(track => track.stop())
+      audioStreamRef.current = null
+      setIsRecording(false)
+    }
+    if (recordingTimerRef.current) {
+      clearInterval(recordingTimerRef.current)
+      recordingTimerRef.current = null
+    }
+  }
+
+  const finishVoiceRecording = () => {
+    shouldSendAudioRef.current = true
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+      mediaRecorderRef.current.stop()
+    }
+    if (recordingTimerRef.current) {
+      clearInterval(recordingTimerRef.current)
+      recordingTimerRef.current = null
+    }
+  }
+
+  useEffect(() => {
+    return () => {
+      if (recordingTimerRef.current) clearInterval(recordingTimerRef.current)
+      audioStreamRef.current?.getTracks().forEach(t => t.stop())
+    }
+  }, [])
+
   const renderHighlightedText = () => {
     if (!inputText) return null
-    if (selectedMentions.length === 0) return inputText
+    const textWithTrailing = inputText.endsWith("\n") ? inputText + " " : inputText
+    if (selectedMentions.length === 0) return textWithTrailing
 
     const mentionNames = selectedMentions.map(m => {
       let name = m.full_name
@@ -166,15 +328,15 @@ export function ChatInput({
       }
       return "@" + name
     })
-    if (mentionNames.length === 0) return inputText
+    if (mentionNames.length === 0) return textWithTrailing
 
     const pattern = new RegExp(`(${mentionNames.join("|")})`, "g")
-    const parts = inputText.split(pattern)
+    const parts = textWithTrailing.split(pattern)
 
     return parts.map((part, index) => {
       if (mentionNames.includes(part)) {
         return (
-          <span key={index} className="text-green-500">
+          <span key={index} className="text-green-500 font-medium">
             {part}
           </span>
         )
@@ -230,7 +392,9 @@ export function ChatInput({
     onMentionAdd(contact)
   }
 
-  const hasContent = inputText.trim() || pastedImage || selectedFile
+  const hasContent = Boolean(
+    inputText.trim() || pastedImage || selectedFile || editingMessage,
+  )
   const [senderName, setSenderName] = useState<string>("")
   const [senderColor, setSenderColor] = useState<string>("")
   const [loadingSenderName, setLoadingSenderName] = useState<boolean>(false)
@@ -271,6 +435,31 @@ export function ChatInput({
       }
     }
   }, [replyingTo, getContactName, getContactColor])
+
+  useEffect(() => {
+    if (replyingTo || editingMessage) {
+      const focus = () => {
+        const el = textareaRef?.current
+        if (el) {
+          el.focus()
+          const len = el.value.length
+          try {
+            el.setSelectionRange(len, len)
+          } catch {}
+        }
+      }
+      focus()
+      requestAnimationFrame(focus)
+      const t1 = setTimeout(focus, 0)
+      const t2 = setTimeout(focus, 50)
+      const t3 = setTimeout(focus, 180)
+      return () => {
+        clearTimeout(t1)
+        clearTimeout(t2)
+        clearTimeout(t3)
+      }
+    }
+  }, [replyingTo, editingMessage, textareaRef])
 
   useEffect(() => {
     const loadAvatars = async () => {
@@ -380,6 +569,55 @@ export function ChatInput({
     )
   }
 
+  const renderEditPreview = () => {
+    if (!editingMessage) return null
+    const originalText =
+      editingMessage.Content?.conversation ||
+      editingMessage.Content?.extendedTextMessage?.text ||
+      ""
+    const isEmpty = !inputText.trim()
+
+    return (
+      <div
+        className={clsx(
+          "flex items-center justify-between p-2 rounded-lg border-l-4 text-xs transition-colors",
+          isEmpty
+            ? "bg-red-500/10 border-red-500"
+            : "bg-green-500/10 border-green-500",
+        )}
+      >
+        <div className="flex-1 min-w-0 pr-2">
+          <div
+            className={clsx(
+              "font-semibold flex items-center gap-1.5 mb-0.5",
+              isEmpty
+                ? "text-red-600 dark:text-red-400"
+                : "text-green-600 dark:text-green-400",
+            )}
+          >
+            <span>{isEmpty ? "🗑️" : "✏️"}</span>
+            <span>
+              {isEmpty
+                ? "Empty message — sending will delete for everyone"
+                : "Edit message"}
+            </span>
+          </div>
+          <div
+            className="line-clamp-2 opacity-80 text-gray-700 dark:text-gray-300"
+            dangerouslySetInnerHTML={{ __html: originalText }}
+          />
+        </div>
+        <button
+          onClick={onCancelEdit}
+          className="ml-2 text-gray-500 hover:text-gray-700 dark:hover:text-gray-200 cursor-pointer"
+          title="Cancel edit (Esc)"
+        >
+          <CloseIcon />
+        </button>
+      </div>
+    )
+  }
+
   return (
     <div className="relative mx-3 mb-3 mt-1.5">
       {showEmojiPicker && (
@@ -395,159 +633,224 @@ export function ChatInput({
         </div>
       )}
 
-      {/* Previews (pasted image / attached file / reply) sit in a card above
+      {/* Previews (pasted image / attached file / reply / edit) sit in a card above
           the composer pill, like WhatsApp. */}
-      {(pastedImage || selectedFile || replyingTo) && (
+      {(pastedImage || selectedFile || replyingTo || editingMessage) && (
         <div className="mb-2 rounded-xl border border-gray-200 bg-light-bg p-2 dark:border-transparent dark:bg-[#242626]">
           {pastedImage && <ImagePreview imageSrc={pastedImage} onRemove={onRemoveFile} />}
           {selectedFile && (
             <FilePreview file={selectedFile} fileType={selectedFileType} onRemove={onRemoveFile} />
           )}
           {renderReplyPreview()}
+          {renderEditPreview()}
         </div>
       )}
       {/* Main input row: rounded pill (emoji left, attach right) with the
           send button as a separate circle outside, WhatsApp-style. */}
-      <div className="flex items-end gap-2">
-        <div className="flex flex-1 items-center rounded-full border border-gray-200 bg-light-bg px-1.5 dark:border-transparent dark:bg-[#242626]">
-          {/* Emoji Button */}
-          <IconButton ref={emojiButtonRef} onClick={onToggleEmojiPicker} title="Emoji">
-            <EmojiIcon />
-          </IconButton>
-
-          {/* Text Input */}
-          <div className="flex-1 bg-transparent rounded-full relative">
-            <div
-              ref={backdropRef}
-              className={clsx(
-                "absolute inset-0 w-full p-2 max-h-32 overflow-y-auto whitespace-pre-wrap break-words pointer-events-none",
-                "text-gray-900 dark:text-white",
-              )}
-              style={{ fontFamily: "inherit", fontSize: "inherit", lineHeight: "inherit" }}
-              aria-hidden="true"
-            >
-              {renderHighlightedText()}
-            </div>
-            <textarea
-              ref={textareaRef}
-              value={inputText}
-              onChange={handleInputChange}
-              onKeyDown={onKeyDown}
-              onPaste={onPaste}
-              onScroll={handleScroll}
-              placeholder="Message"
-              className={clsx(
-                "relative z-10 w-full p-2 bg-transparent resize-none outline-none max-h-32",
-                "text-transparent caret-green",
-                "placeholder:text-gray-500",
-              )}
-              rows={1}
-            />
-            {/* Mention Suggestions */}
-            {showSuggestions && (
-              <div
-                ref={suggestionsRef}
-                className="absolute bottom-full left-0 right-0 bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-lg shadow-lg z-50 max-h-40 overflow-y-auto"
-              >
-                {mentionSuggestions.map(contact => {
-                  const avatar = mentionAvatars[contact.phno]
-                  const isLoading = loadingAvatars[contact.phno]
-                  return (
-                    <div
-                      key={contact.phno}
-                      onClick={() => handleSuggestionClick(contact)}
-                      className="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 cursor-pointer flex items-center gap-2"
-                    >
-                      <div className="w-8 h-8 rounded-full bg-gray-300 dark:bg-gray-600 overflow-hidden flex items-center justify-center shrink-0">
-                        {isLoading ? (
-                          <div className="w-4 h-4 border-2 border-gray-400 border-t-transparent rounded-full animate-spin" />
-                        ) : avatar ? (
-                          <img
-                            src={avatar}
-                            alt={contact.full_name || contact.push_name || contact.short}
-                            className="w-full h-full object-cover"
-                          />
-                        ) : (
-                          <UserAvatar />
-                        )}
-                      </div>
-                      <span>
-                        {contact.full_name || contact.push_name || contact.short || contact.phno}
-                      </span>
-                    </div>
-                  )
-                })}
-              </div>
-            )}
-          </div>
-
-          {/* Attach Button + WhatsApp-style attach menu */}
-          <div className="relative">
-            <IconButton onClick={() => setAttachMenuOpen(v => !v)} title="Attach">
-              <AttachIcon />
-            </IconButton>
-            {attachMenuOpen && (
-              <>
-                <div className="fixed inset-0 z-40" onClick={() => setAttachMenuOpen(false)} />
-                <div className="absolute bottom-12 right-0 z-50 w-48 rounded-xl bg-white py-2 shadow-lg dark:bg-dark-secondary">
-                  {(
-                    [
-                      {
-                        label: "📷 Photos & videos",
-                        act: () => {
-                          setFileAccept("image/*,video/*")
-                          setTimeout(() => fileInputRef.current?.click(), 0)
-                        },
-                      },
-                      {
-                        label: "📄 Document",
-                        act: () => {
-                          setFileAccept("*/*")
-                          setTimeout(() => fileInputRef.current?.click(), 0)
-                        },
-                      },
-                      { label: "📊 Poll", act: () => setPollOpen(true) },
-                      { label: "👤 Contact", act: () => setContactOpen(true) },
-                    ] as const
-                  ).map(item => (
-                    <button
-                      key={item.label}
-                      onClick={() => {
-                        setAttachMenuOpen(false)
-                        item.act()
-                      }}
-                      className="block w-full px-4 py-2 text-left text-sm text-gray-800 hover:bg-gray-100 dark:text-gray-100 dark:hover:bg-white/5"
-                    >
-                      {item.label}
-                    </button>
-                  ))}
-                </div>
-              </>
-            )}
-          </div>
-
-          {/* Hidden File Input */}
-          <input
-            type="file"
-            ref={fileInputRef}
-            onChange={onFileSelect}
-            className="hidden"
-            accept={fileAccept}
-          />
+      {recordingError && (
+        <div className="mb-2 text-xs text-red-500 bg-red-100 dark:bg-red-900/30 px-3 py-1.5 rounded-lg">
+          {recordingError}
         </div>
+      )}
 
-        {/* Send Button — separate green circle outside the pill */}
-        <button
-          onClick={onSendMessage}
-          disabled={!hasContent}
-          className={clsx(
-            "mb-0.5 flex h-11 w-11 shrink-0 items-center justify-center rounded-full text-white transition-colors",
-            hasContent ? "bg-green hover:bg-green/80" : "bg-green/50 cursor-not-allowed",
+      {isRecording ? (
+        <div className="flex items-center gap-2">
+          <div className="flex flex-1 items-center justify-between rounded-full border border-red-500/30 bg-red-50/60 px-4 py-2 dark:border-red-500/20 dark:bg-red-950/25">
+            <div className="flex items-center gap-3">
+              <span className="h-3 w-3 rounded-full bg-red-500 animate-pulse" />
+              <span className="font-mono text-sm font-semibold text-red-600 dark:text-red-400">
+                {formatTimer(recordingDuration)}
+              </span>
+              <div className="flex items-center gap-1 ml-2">
+                <span className="h-2 w-0.5 rounded-full bg-red-400 animate-pulse" style={{ animationDelay: "0ms" }} />
+                <span className="h-4 w-0.5 rounded-full bg-red-500 animate-pulse" style={{ animationDelay: "150ms" }} />
+                <span className="h-3 w-0.5 rounded-full bg-red-400 animate-pulse" style={{ animationDelay: "300ms" }} />
+                <span className="h-5 w-0.5 rounded-full bg-red-500 animate-pulse" style={{ animationDelay: "450ms" }} />
+                <span className="h-2 w-0.5 rounded-full bg-red-400 animate-pulse" style={{ animationDelay: "200ms" }} />
+              </div>
+            </div>
+            <button
+              onClick={cancelVoiceRecording}
+              className="text-gray-500 hover:text-red-600 dark:text-gray-400 dark:hover:text-red-400 p-1.5 transition-colors"
+              title="Cancel recording"
+            >
+              <TrashIcon />
+            </button>
+          </div>
+          <button
+            onClick={finishVoiceRecording}
+            className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-green hover:bg-green/80 text-white shadow-md transition-colors"
+            title="Send voice note"
+          >
+            <SendIcon />
+          </button>
+        </div>
+      ) : (
+        <div className="flex items-end gap-2">
+          <div
+            className={clsx(
+              "flex flex-1 items-end border border-gray-200 bg-light-bg px-1.5 py-1 dark:border-transparent dark:bg-[#242626] transition-[border-radius] duration-150",
+              isMultiline ? "rounded-2xl" : "rounded-full",
+            )}
+          >
+            {/* Emoji Button */}
+            <IconButton ref={emojiButtonRef} onClick={onToggleEmojiPicker} title="Emoji">
+              <EmojiIcon />
+            </IconButton>
+
+            {/* Text Input */}
+            <div className="flex-1 bg-transparent relative my-auto">
+              <div
+                ref={backdropRef}
+                className={clsx(
+                  "absolute inset-0 w-full px-2 py-1.5 text-sm leading-5 whitespace-pre-wrap break-words pointer-events-none overflow-hidden",
+                  "text-gray-900 dark:text-white",
+                )}
+                style={{
+                  fontFamily: "inherit",
+                  fontSize: "14px",
+                  lineHeight: "20px",
+                  wordBreak: "break-word",
+                }}
+                aria-hidden="true"
+              >
+                {renderHighlightedText()}
+              </div>
+              <textarea
+                ref={textareaRef}
+                value={inputText}
+                onChange={handleInputChange}
+                onKeyDown={onKeyDown}
+                onPaste={onPaste}
+                onScroll={handleScroll}
+                placeholder="Message"
+                className={clsx(
+                  "relative z-10 w-full px-2 py-1.5 text-sm leading-5 bg-transparent resize-none outline-none overflow-y-auto",
+                  "text-transparent caret-[#00a884] dark:caret-[#00a884]",
+                  "placeholder:text-gray-500",
+                )}
+                style={{
+                  fontFamily: "inherit",
+                  fontSize: "14px",
+                  lineHeight: "20px",
+                  minHeight: "36px",
+                  maxHeight: "140px",
+                }}
+                rows={1}
+              />
+              {/* Mention Suggestions */}
+              {showSuggestions && (
+                <div
+                  ref={suggestionsRef}
+                  className="absolute bottom-full left-0 right-0 bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-lg shadow-lg z-50 max-h-40 overflow-y-auto"
+                >
+                  {mentionSuggestions.map(contact => {
+                    const avatar = mentionAvatars[contact.phno]
+                    const isLoading = loadingAvatars[contact.phno]
+                    return (
+                      <div
+                        key={contact.phno}
+                        onClick={() => handleSuggestionClick(contact)}
+                        className="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 cursor-pointer flex items-center gap-2"
+                      >
+                        <div className="w-8 h-8 rounded-full bg-gray-300 dark:bg-gray-600 overflow-hidden flex items-center justify-center shrink-0">
+                          {isLoading ? (
+                            <div className="w-4 h-4 border-2 border-gray-400 border-t-transparent rounded-full animate-spin" />
+                          ) : avatar ? (
+                            <img
+                              src={avatar}
+                              alt={contact.full_name || contact.push_name || contact.short}
+                              className="w-full h-full object-cover"
+                            />
+                          ) : (
+                            <UserAvatar />
+                          )}
+                        </div>
+                        <span>
+                          {contact.full_name || contact.push_name || contact.short || contact.phno}
+                        </span>
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+            </div>
+
+            {/* Attach Button + WhatsApp-style attach menu */}
+            <div className="relative">
+              <IconButton onClick={() => setAttachMenuOpen(v => !v)} title="Attach">
+                <AttachIcon />
+              </IconButton>
+              {attachMenuOpen && (
+                <>
+                  <div className="fixed inset-0 z-40" onClick={() => setAttachMenuOpen(false)} />
+                  <div className="absolute bottom-12 right-0 z-50 w-48 rounded-xl bg-white py-2 shadow-lg dark:bg-dark-secondary">
+                    {(
+                      [
+                        {
+                          label: "📷 Photos & videos",
+                          act: () => {
+                            setFileAccept("image/*,video/*")
+                            setTimeout(() => fileInputRef.current?.click(), 0)
+                          },
+                        },
+                        {
+                          label: "📄 Document",
+                          act: () => {
+                            setFileAccept("*/*")
+                            setTimeout(() => fileInputRef.current?.click(), 0)
+                          },
+                        },
+                        { label: "📊 Poll", act: () => setPollOpen(true) },
+                        { label: "👤 Contact", act: () => setContactOpen(true) },
+                      ] as const
+                    ).map(item => (
+                      <button
+                        key={item.label}
+                        onClick={() => {
+                          setAttachMenuOpen(false)
+                          item.act()
+                        }}
+                        className="block w-full px-4 py-2 text-left text-sm text-gray-800 hover:bg-gray-100 dark:text-gray-100 dark:hover:bg-white/5"
+                      >
+                        {item.label}
+                      </button>
+                    ))}
+                  </div>
+                </>
+              )}
+            </div>
+
+            {/* Hidden File Input */}
+            <input
+              type="file"
+              ref={fileInputRef}
+              onChange={onFileSelect}
+              className="hidden"
+              accept={fileAccept}
+            />
+          </div>
+
+          {/* Send Button or Mic Button */}
+          {hasContent ? (
+            <button
+              onClick={onSendMessage}
+              className="mb-0.5 flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-green hover:bg-green/80 text-white transition-colors shadow-sm"
+              title="Send message"
+            >
+              <SendIcon />
+            </button>
+          ) : (
+            <button
+              onClick={startVoiceRecording}
+              className="mb-0.5 flex h-11 w-11 shrink-0 items-center justify-center rounded-full text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-[#242626] transition-colors"
+              title="Record voice note"
+            >
+              <MicIcon />
+            </button>
           )}
-        >
-          <SendIcon />
-        </button>
-      </div>
+        </div>
+      )}
 
       {pollOpen && <PollDialog chatId={chatId} onClose={() => setPollOpen(false)} />}
       {contactOpen && <ContactShareDialog chatId={chatId} onClose={() => setContactOpen(false)} />}

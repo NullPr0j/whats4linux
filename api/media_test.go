@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -9,8 +11,8 @@ import (
 	"github.com/lugvitc/whats4linux/internal/cache"
 	"github.com/lugvitc/whats4linux/internal/misc"
 	messageStore "github.com/lugvitc/whats4linux/internal/store"
-	"go.mau.fi/whatsmeow/proto/waE2E"
-	"go.mau.fi/whatsmeow/types"
+	"github.com/polymorfa/hypermeow/proto/waE2E"
+	"github.com/polymorfa/hypermeow/types"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -20,6 +22,9 @@ func newMediaTestAPI(t *testing.T) *Api {
 	misc.ConfigDir = t.TempDir()
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	t.Cleanup(func() { misc.ConfigDir = oldConfigDir })
+
+	messageStore.LoadSettings()
+	t.Cleanup(func() { _ = messageStore.CloseSettings() })
 
 	store, err := messageStore.NewMessageStore()
 	if err != nil {
@@ -91,5 +96,84 @@ func TestMediaMethodsHandleUninitialisedAPI(t *testing.T) {
 	}
 	if _, err := a.GetCachedAvatar("123@s.whatsapp.net", false); err == nil {
 		t.Fatal("GetCachedAvatar returned no error without an image cache")
+	}
+	if err := a.DownloadFile("message"); err == nil {
+		t.Fatal("DownloadFile returned no error without a message store")
+	}
+	if err := a.DownloadImageToFile("message"); err == nil {
+		t.Fatal("DownloadImageToFile returned no error without a message store")
+	}
+}
+
+func TestDownloadFileSavesCachedImage(t *testing.T) {
+	a := newMediaTestAPI(t)
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+
+	testData := []byte("fake-image-bytes")
+	msgID := "img-msg-123"
+	if _, err := a.imageCache.SaveImage(msgID, testData, "image/png", 100, 100); err != nil {
+		t.Fatalf("failed to save image to cache: %v", err)
+	}
+
+	if err := a.DownloadFile(msgID); err != nil {
+		t.Fatalf("DownloadFile failed: %v", err)
+	}
+
+	expectedPath := filepath.Join(tempHome, "Downloads", "Whats4L", msgID+".png")
+	savedData, err := os.ReadFile(expectedPath)
+	if err != nil {
+		t.Fatalf("expected file to be written at %s: %v", expectedPath, err)
+	}
+	if string(savedData) != string(testData) {
+		t.Fatalf("file content mismatch: got %s, want %s", string(savedData), string(testData))
+	}
+}
+
+func TestDownloadDirectoryConfigurable(t *testing.T) {
+	a := newMediaTestAPI(t)
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+
+	// Default should be ~/Downloads/Whats4L
+	def := a.GetDownloadDirectory()
+	expectedDef := filepath.Join(tempHome, "Downloads", "Whats4L")
+	if def != expectedDef {
+		t.Fatalf("GetDownloadDirectory default = %q, want %q", def, expectedDef)
+	}
+
+	// Custom directory
+	custom := filepath.Join(tempHome, "CustomDownloads")
+	if err := a.SetDownloadDirectory(custom); err != nil {
+		t.Fatalf("SetDownloadDirectory failed: %v", err)
+	}
+	if got := a.GetDownloadDirectory(); got != custom {
+		t.Fatalf("GetDownloadDirectory custom = %q, want %q", got, custom)
+	}
+
+	// Tilde expansion
+	if err := a.SetDownloadDirectory("~/MyTildeDir"); err != nil {
+		t.Fatalf("SetDownloadDirectory tilde failed: %v", err)
+	}
+	expectedTilde := filepath.Join(tempHome, "MyTildeDir")
+	if got := a.GetDownloadDirectory(); got != expectedTilde {
+		t.Fatalf("GetDownloadDirectory tilde = %q, want %q", got, expectedTilde)
+	}
+}
+
+func TestGetCachedAvatarCanonicalDeviceJID(t *testing.T) {
+	a := newMediaTestAPI(t)
+	dummyData := []byte("fake-jpeg-data")
+	if _, err := a.imageCache.SaveAvatar("123@s.whatsapp.net", dummyData, "image/jpeg"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Should resolve even when querying with a device suffix
+	avatarURL, err := a.GetCachedAvatar("123:2@s.whatsapp.net", false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.HasPrefix(avatarURL, "data:image/jpeg;base64,") {
+		t.Fatalf("expected data URL, got %q", avatarURL)
 	}
 }
